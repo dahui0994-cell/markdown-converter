@@ -4,10 +4,16 @@
 预留 Word / JPG / PNG 的扩展接口, 后续实现即可, 页面与调用方不用改。
 """
 
+import io
+import re
 from pathlib import Path
 from urllib.parse import quote
 
 import markdown
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Pt, RGBColor
 from playwright.sync_api import sync_playwright
 
 # 单一事实来源: 所有输出(PDF/预览)共用这一套样式, 保证所见即所得
@@ -165,11 +171,207 @@ def markdown_to_pdf(md_text: str) -> tuple[bytes, str]:
 
 
 # ---------------------------------------------------------------------------
-# 以下为后续扩展接口(当前抛出 NotImplementedError), 页面右栏格式按钮预留这些
+# Word 导出: 轻量解析 Markdown 结构(标题/列表/表格/代码/引用), 用 python-docx
+# 生成 .docx。中文字体统一微软雅黑, 行内 **加粗** / *斜体* / `代码` / [链接]。
 # ---------------------------------------------------------------------------
 
+_INLINE = re.compile(r"(\*\*(.+?)\*\*)|(\*(.+?)\*)|(`(.+?)`)|(\[(.+?)\]\((.+?)\))")
+
+
+def _doc_set_cjk(run, font="Microsoft YaHei"):
+    """让 run 使用中文字体(东亚字体), 否则 Word 默认西文字体无法渲染中文。"""
+    run.font.name = font
+    rpr = run._element.get_or_add_rPr()
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    rfonts.set(qn("w:eastAsia"), font)
+
+
+def _add_inline_runs(paragraph, text):
+    """解析行内 Markdown(加粗/斜体/代码/链接), 往 paragraph 加 run。"""
+    pos = 0
+    for m in _INLINE.finditer(text):
+        if m.start() > pos:
+            r = paragraph.add_run(text[pos:m.start()])
+            _doc_set_cjk(r)
+        if m.group(2) is not None:      # **加粗**
+            r = paragraph.add_run(m.group(2)); r.bold = True
+            _doc_set_cjk(r)
+        elif m.group(4) is not None:    # *斜体*
+            r = paragraph.add_run(m.group(4)); r.italic = True
+            _doc_set_cjk(r)
+        elif m.group(6) is not None:    # `行内代码`
+            r = paragraph.add_run(m.group(6))
+            r.font.name = "Consolas"
+            r.font.color.rgb = RGBColor(0xC7, 0x25, 0x4E)
+            _doc_set_cjk(r, "Consolas")
+        elif m.group(8) is not None:    # [文本](url)
+            r = paragraph.add_run(m.group(8)); r.font.color.rgb = RGBColor(0x2F, 0x6F, 0xEB)
+            _doc_set_cjk(r)
+        pos = m.end()
+    if pos < len(text):
+        r = paragraph.add_run(text[pos:])
+        _doc_set_cjk(r)
+
+
+def _set_cell_borders(cell):
+    """给表格单元格加细边框(默认无边框)。"""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    borders = OxmlElement("w:tcBorders")
+    for edge in ("top", "left", "bottom", "right"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), "4")
+        el.set(qn("w:color"), "D0D7DE")
+        borders.append(el)
+    tcPr.append(borders)
+
+
+def _markdown_blocks_to_doc(doc, md_text: str) -> None:
+    """把 Markdown 的块级结构写进 Word 文档。"""
+    lines = md_text.splitlines()
+    i = 0
+    in_code = False
+    code_buf: list[str] = []
+
+    while i < len(lines):
+        raw = lines[i]
+        line = raw.rstrip()
+
+        # 代码块
+        if line.lstrip().startswith("```"):
+            if not in_code:
+                in_code, code_buf = True, []
+                i += 1
+                continue
+            else:
+                in_code = False
+                p = doc.add_paragraph()
+                p.paragraph_format.left_indent = Pt(12)
+                r = p.add_run("\n".join(code_buf))
+                r.font.name = "Consolas"
+                r.font.size = Pt(9)
+                r.font.color.rgb = RGBColor(0x24, 0x29, 0x2F)
+                _doc_set_cjk(r, "Consolas")
+                i += 1
+                continue
+        if in_code:
+            code_buf.append(raw)
+            i += 1
+            continue
+
+        stripped = line.strip()
+        # 空行
+        if not stripped:
+            i += 1
+            continue
+        # 标题
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            level = min(len(m.group(1)), 9)
+            p = doc.add_heading(m.group(2).strip(), level=level)
+            for run in p.runs:
+                _doc_set_cjk(run)
+            i += 1
+            continue
+        # 分隔线
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", stripped):
+            p = doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(6)
+            p.paragraph_format.space_after = Pt(6)
+            i += 1
+            continue
+        # 表格
+        if stripped.startswith("|") and i + 1 < len(lines) and re.match(r"^\|[\s\-:|]+\|$", lines[i + 1].strip()):
+            header_cells = [c.strip() for c in stripped.strip("|").split("|")]
+            i += 2  # 跳过表头与分隔行
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
+                i += 1
+            table = doc.add_table(rows=1 + len(rows), cols=len(header_cells))
+            table.style = "Table Grid"
+            for ci, txt in enumerate(header_cells):
+                cell = table.rows[0].cells[ci]
+                cell.text = txt
+                for pr in cell.paragraphs[0].runs:
+                    pr.bold = True
+                    _doc_set_cjk(pr)
+            for ri, row in enumerate(rows):
+                for ci in range(len(header_cells)):
+                    cell = table.rows[ri + 1].cells[ci]
+                    val = row[ci] if ci < len(row) else ""
+                    cell.text = val
+                    for pr in cell.paragraphs[0].runs:
+                        _doc_set_cjk(pr)
+            continue
+        # 引用
+        if stripped.startswith(">"):
+            p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Pt(18)
+            txt = stripped.lstrip("> ").strip()
+            _add_inline_runs(p, txt)
+            p.paragraph_format.space_before = Pt(4)
+            p.paragraph_format.space_after = Pt(4)
+            i += 1
+            continue
+        # 列表
+        m_li = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", raw)
+        if m_li:
+            indent = len(m_li.group(1))
+            ordered = m_li.group(2)[0].isdigit()
+            style = ("List Number" if ordered else "List Bullet")
+            p = doc.add_paragraph(style=style)
+            p.paragraph_format.left_indent = Pt(18 + indent * 10)
+            _add_inline_runs(p, m_li.group(3).strip())
+            i += 1
+            continue
+        # 普通段落
+        p = doc.add_paragraph()
+        p.paragraph_format.first_line_indent = Pt(24)
+        p.paragraph_format.space_after = Pt(6)
+        _add_inline_runs(p, stripped)
+        i += 1
+
+    # 若结尾仍在代码块内(未闭合), 兜底输出
+    if in_code and code_buf:
+        p = doc.add_paragraph()
+        r = p.add_run("\n".join(code_buf))
+        r.font.name = "Consolas"
+        _doc_set_cjk(r, "Consolas")
+
+
+def _new_word_doc() -> Document:
+    """新建文档并设中文默认样式(微软雅黑正文 + 标题)。"""
+    doc = Document()
+    normal = doc.styles["Normal"]
+    normal.font.name = "Microsoft YaHei"
+    normal.font.size = Pt(11)
+    normal.element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    for hs in doc.styles:
+        if hs.name and hs.name.startswith("Heading"):
+            try:
+                hs.font.name = "Microsoft YaHei"
+                if hs.element.rPr is not None and hs.element.rPr.rFonts is not None:
+                    hs.element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+            except Exception:
+                continue
+    return doc
+
+
 def markdown_to_word(md_text: str) -> tuple[bytes, str]:
-    raise NotImplementedError("Word 导出尚未实现(后续扩展)")
+    """Markdown -> Word(.docx), 返回 (docx 字节, 建议文件名)。"""
+    doc = _new_word_doc()
+    _markdown_blocks_to_doc(doc, md_text)
+    buf = io.BytesIO()
+    doc.save(buf)
+    data = buf.getvalue()
+    if not data.startswith(b"PK"):
+        raise RuntimeError("生成的 docx 无效")
+    return data, (extract_title(md_text) or "文档") + ".docx"
 
 
 def markdown_to_jpg(md_text: str) -> tuple[bytes, str]:

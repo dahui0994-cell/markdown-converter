@@ -29,7 +29,7 @@ WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 # 当前可用格式(后端已实现的), 页面右栏据此渲染按钮
-AVAILABLE_FORMATS = ["pdf"]
+AVAILABLE_FORMATS = ["pdf", "word"]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -76,7 +76,12 @@ def convert(md: str = Form(...), format: str = Form("pdf")):
     except Exception as e:
         raise HTTPException(500, f"转换失败: {e}")
     encoded = quote(filename)
-    media = {"pdf": "application/pdf"}.get(format, "application/octet-stream")
+    media = {
+        "pdf": "application/pdf",
+        "word": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "jpg": "image/jpeg",
+        "png": "image/png",
+    }.get(format, "application/octet-stream")
     return Response(
         content=data,
         media_type=media,
