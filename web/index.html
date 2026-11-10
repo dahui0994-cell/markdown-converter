@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Markdown 转换工具</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; height: 100vh;          /* 整页锁死一屏, 内容多时在板块内部滚动 */
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    background: #f4f6f8; color: #24292f;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* 顶栏 */
+  .topbar {
+    background: #fff; padding: 14px 24px;
+    display: flex; align-items: center; justify-content: space-between;
+    box-shadow: 0 1px 4px rgba(0,0,0,.06); flex-shrink: 0;
+  }
+  .topbar h1 { font-size: 18px; margin: 0; }
+  .topbar h1 span { color: #2f6feb; }
+  #top-status { font-size: 13px; color: #666; min-width: 240px; text-align: right; }
+  #top-status.ok { color: #1a7f37; }
+  #top-status.err { color: #d1242f; }
+
+  /* 三板块主体 */
+  .board {
+    flex: 1; display: grid;
+    grid-template-columns: 25% 40% 35%;   /* 左 25% / 中 40% / 右 35% */
+    grid-template-rows: 1fr;             /* 三板块等高, 撑满剩余视口 */
+    gap: 14px; padding: 14px 20px;
+    min-height: 0; overflow: hidden;
+  }
+  .panel {
+    background: #fff; border-radius: 12px;
+    box-shadow: 0 2px 10px rgba(0,0,0,.06);
+    display: flex; flex-direction: column;
+    min-height: 0; overflow: hidden;     /* 高度由视口决定, 内容在内部滚动 */
+  }
+  .panel-title {
+    padding: 10px 16px; font-size: 14px; font-weight: 700;
+    border-bottom: 1px solid #eef0f3;
+    display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  }
+  .panel-title .tag {
+    font-size: 11px; font-weight: 400; color: #888;
+  }
+  .panel-body { flex: 1; padding: 14px 16px; overflow: auto; min-height: 0; }
+
+  /* ===== 左:输入区 ===== */
+  .panel-body.input-body { display: flex; flex-direction: column; }
+  #md-input {
+    flex: 1; min-height: 240px;          /* 固定填满面板, 高度不随内容变化 */
+    width: 100%; overflow: auto;         /* 文本过多时内部滚动 */
+    resize: none;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 14px; line-height: 1.7;
+    border: 2px solid #d8dde3; border-radius: 10px;
+    padding: 12px 14px; outline: none;
+    transition: border-color .2s;
+  }
+  #md-input:focus { border-color: #2f6feb; }
+  .tools { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .btn {
+    border: 1px solid #d0d7de; background: #fff; color: #24292f;
+    border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+    transition: all .15s;
+  }
+  .btn:hover { border-color: #2f6feb; color: #2f6feb; }
+  .btn.primary {
+    background: #2f6feb; border-color: #2f6feb; color: #fff;
+    font-size: 15px; padding: 12px 20px;
+  }
+  .btn.primary:hover { background: #2458c4; color: #fff; }
+  .btn.primary:disabled { background: #a8c4f0; border-color: #a8c4f0; cursor: wait; }
+
+  /* ===== 中:实时预览区 ===== */
+  #preview {
+    font-size: 13px; line-height: 1.8; color: #333;
+  }
+  #preview .empty { color: #aaa; text-align: center; padding: 40px 0; }
+  /* 预览区把排版样式缩小, 便于在面板内查看 */
+  #preview { font-size: 11pt; }
+
+  /* ===== 右:格式与下载区 ===== */
+  .fmt-label { font-size: 13px; font-weight: 700; color: #555; margin-bottom: 10px; }
+  .fmt-list { display: flex; flex-direction: column; gap: 8px; }
+  .fmt-item {
+    display: flex; align-items: center; gap: 10px;
+    border: 2px solid #e3e8ef; border-radius: 10px; padding: 12px 14px;
+    cursor: pointer; transition: all .15s; user-select: none;
+  }
+  .fmt-item:hover { border-color: #a8c4f0; }
+  .fmt-item.selected { border-color: #2f6feb; background: #f0f5ff; }
+  .fmt-item.disabled { opacity: .5; cursor: not-allowed; }
+  .fmt-item .icon { font-size: 22px; }
+  .fmt-item .name { font-size: 14px; font-weight: 700; }
+  .fmt-item .desc { font-size: 11px; color: #888; }
+  .fmt-item .mark { margin-left: auto; font-size: 11px; }
+  .fmt-item .mark.ready { color: #1a7f37; }
+  .fmt-item .mark.soon { color: #999; }
+
+  .download-zone { margin-top: 24px; }
+  #dl-status { font-size: 12px; color: #666; margin-top: 10px; min-height: 16px; }
+  #dl-status.ok { color: #1a7f37; }
+  #dl-status.err { color: #d1242f; }
+
+  /* 底栏 */
+  .footer {
+    background: #fff; padding: 8px 24px; font-size: 12px; color: #999;
+    border-top: 1px solid #eef0f3; flex-shrink: 0;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>📄 Markdown 转换工具</h1>
+  <div id="top-status"></div>
+</div>
+
+<div class="board">
+  <!-- 左:输入区 -->
+  <div class="panel">
+    <div class="panel-title">✍️ 输入区 <span class="tag">粘贴或上传</span></div>
+    <div class="panel-body input-body">
+      <textarea id="md-input"
+        placeholder="# 标题&#10;&#10;在这里粘贴你的 Markdown……&#10;&#10;- 支持标题、列表&#10;- 支持表格、代码块"></textarea>
+      <div class="tools">
+        <button class="btn" id="btn-sample">加载示例</button>
+        <button class="btn" id="btn-upload">上传 .md</button>
+        <button class="btn" id="btn-clear">清空</button>
+        <input type="file" id="file-input" accept=".md,.markdown,.txt" style="display:none">
+      </div>
+    </div>
+  </div>
+
+  <!-- 中:实时预览区 -->
+  <div class="panel">
+    <div class="panel-title">👁 实时预览 <span class="tag">所见即排版</span></div>
+    <div class="panel-body" id="preview"><div class="empty">输入内容后这里实时显示效果</div></div>
+  </div>
+
+  <!-- 右:格式与下载区 -->
+  <div class="panel">
+    <div class="panel-title">📦 输出格式</div>
+    <div class="panel-body">
+      <div class="fmt-label">选择格式</div>
+      <div class="fmt-list" id="fmt-list"></div>
+
+      <div class="download-zone">
+        <button class="btn primary" id="btn-dl" style="width:100%">⬇ 下载 PDF</button>
+        <div id="dl-status"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">本地服务 · 数据不出本机 · PDF 已支持，Word / JPG / PNG 敬请期待</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let selectedFmt = "pdf";
+let available = [];
+const FMT_META = {
+  pdf:  { icon: "📕", name: "PDF",  desc: "已支持，排版美观" },
+  word: { icon: "📘", name: "Word", desc: "即将支持" },
+  jpg:  { icon: "🖼️", name: "JPG",  desc: "即将支持" },
+  png:  { icon: "🖼️", name: "PNG",  desc: "即将支持" },
+};
+
+/* ---------- 中栏: 实时预览 ---------- */
+/* 输入框固定高度, 内容多时内部滚动, 无需 JS 调高度 */
+let previewTimer = null;
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(doPreview, 250);
+}
+$("md-input").addEventListener("input", schedulePreview);
+async function doPreview() {
+  const md = $("md-input").value;
+  const box = $("preview");
+  if (!md.trim()) { box.innerHTML = "<div class='empty'>输入内容后这里实时显示效果</div>"; return; }
+  try {
+    const r = await fetch("/api/html-preview?md=" + encodeURIComponent(md));
+    const data = await r.json();
+    box.innerHTML = data.html;
+    if (data.css) {  // 注入与 PDF 同一套排版样式, 所见即所得
+      const tag = document.createElement("style");
+      tag.id = "preview-layout-css";
+      tag.textContent = data.css;
+      document.head.appendChild(tag);
+    }
+  } catch (e) {
+    box.innerHTML = "<div class='empty' style='color:#d1242f'>预览失败: " + e.message + "</div>";
+  }
+}
+
+/* ---------- 右栏: 格式列表 ---------- */
+async function loadFormats() {
+  const r = await fetch("/api/formats");
+  const d = await r.json();
+  available = d.available;
+  const list = $("fmt-list");
+  list.innerHTML = "";
+  for (const key of ["pdf","word","jpg","png"]) {
+    const meta = FMT_META[key];
+    const ok = available.includes(key);
+    const div = document.createElement("div");
+    div.className = "fmt-item" + (key === selectedFmt ? " selected" : "") + (ok ? "" : " disabled");
+    div.innerHTML = `<span class="icon">${meta.icon}</span>
+      <span><div class="name">${meta.name}</div><div class="desc">${meta.desc}</div></span>
+      <span class="mark ${ok ? "ready" : "soon"}">${ok ? "可用" : "敬请期待"}</span>`;
+    div.addEventListener("click", () => {
+      if (!ok) { setTopStatus("该格式尚未实现，敬请期待", "err"); return; }
+      selectedFmt = key;
+      list.querySelectorAll(".fmt-item").forEach(x => x.classList.remove("selected"));
+      div.classList.add("selected");
+      $("btn-dl").textContent = "⬇ 下载 " + meta.name;
+    });
+    list.appendChild(div);
+  }
+  $("btn-dl").textContent = "⬇ 下载 " + FMT_META[selectedFmt].name;
+}
+
+/* ---------- 顶栏状态 ---------- */
+function setTopStatus(msg, cls) {
+  const el = $("top-status");
+  el.textContent = msg; el.className = cls || "";
+}
+
+/* ---------- 左栏按钮 ---------- */
+$("btn-clear").addEventListener("click", () => {
+  $("md-input").value = ""; doPreview();
+});
+$("btn-upload").addEventListener("click", () => $("file-input").click());
+$("file-input").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("md-input").value = await f.text();
+  schedulePreview();
+  setTopStatus("已读取文件: " + f.name, "ok");
+});
+$("btn-sample").addEventListener("click", async () => {
+  const r = await fetch("/api/sample");
+  const d = await r.json();
+  $("md-input").value = d.md;
+  schedulePreview();
+  setTopStatus("已加载示例文档", "ok");
+});
+
+/* ---------- 右栏下载 ---------- */
+$("btn-dl").addEventListener("click", async () => {
+  const md = $("md-input").value.trim();
+  if (!md) { setTopStatus("请先输入 Markdown 内容", "err"); return; }
+  const st = $("dl-status"), btn = $("btn-dl");
+  btn.disabled = true; st.textContent = "正在生成 " + FMT_META[selectedFmt].name + "，请稍候……"; st.className = "";
+  const form = new FormData();
+  form.append("md", md); form.append("format", selectedFmt);
+  try {
+    const res = await fetch("/api/convert", { method: "POST", body: form });
+    if (!res.ok) {
+      let msg = "HTTP " + res.status;
+      try { msg = (await res.json()).detail || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    let name = FMT_META[selectedFmt].name.toLowerCase() + "." + selectedFmt;
+    const cd = res.headers.get("Content-Disposition") || "";
+    const ext = cd.match(/filename\*=UTF-8''(.+?)(?:;|$)/i);
+    const reg = cd.match(/filename="?([^";]+)"?/i);
+    if (ext) { try { name = decodeURIComponent(ext[1]); } catch (e) { name = ext[1]; } }
+    else if (reg) { name = reg[1]; }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+    st.textContent = "✅ 已生成并开始下载"; st.className = "ok";
+    setTopStatus("转换成功: " + name, "ok");
+  } catch (err) {
+    st.textContent = "❌ " + err.message; st.className = "err";
+    setTopStatus("转换失败: " + err.message, "err");
+  } finally { btn.disabled = false; }
+});
+
+/* ---------- 初始化 ---------- */
+loadFormats();
+</script>
+</body>
+</html>
