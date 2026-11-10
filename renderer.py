@@ -375,11 +375,55 @@ def markdown_to_word(md_text: str) -> tuple[bytes, str]:
 
 
 def markdown_to_jpg(md_text: str) -> tuple[bytes, str]:
-    raise NotImplementedError("JPG 导出尚未实现(后续扩展)")
+    """Markdown -> JPG 图片, 返回 (图片字节, 建议文件名)。"""
+    return _markdown_to_image(md_text, "jpeg")
 
 
 def markdown_to_png(md_text: str) -> tuple[bytes, str]:
-    raise NotImplementedError("PNG 导出尚未实现(后续扩展)")
+    """Markdown -> PNG 图片, 返回 (图片字节, 建议文件名)。"""
+    return _markdown_to_image(md_text, "png")
+
+
+_IMG_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  {css}
+  html, body {{ margin: 0; padding: 0; background: #fff; }}
+  .doc {{ padding: 36px 44px; }}
+</style>
+</head>
+<body>
+<div class="doc">{content}</div>
+</body>
+</html>"""
+
+
+def _markdown_to_image(md_text: str, fmt: str) -> tuple[bytes, str]:
+    """把 Markdown 渲染成一张长图(png/jpeg)。内容在固定宽度容器内排版。"""
+    body = markdown_to_html_body(md_text)
+    # 图片版用「容器内」作用域样式: 把 LAYOUT_CSS 选择器加到 .doc 下, 白底
+    css = preview_css().replace("#preview", ".doc")
+    html = _IMG_HTML_TEMPLATE.format(css=css, content=body)
+    ext = "jpg" if fmt == "jpeg" else "png"
+    mime = "jpeg" if fmt == "jpeg" else "png"
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        try:
+            page = browser.new_page(viewport={"width": 900, "height": 1200})
+            page.set_content(html)
+            page.wait_for_timeout(200)
+            if mime == "jpeg":
+                img = page.screenshot(type="jpeg", full_page=True, quality=90)
+            else:
+                img = page.screenshot(type="png", full_page=True)
+        finally:
+            browser.close()
+    magic = (b"\xff\xd8\xff" if fmt == "jpeg" else b"\x89PNG")
+    if not img.startswith(magic):
+        raise RuntimeError(f"生成的 {ext} 图片无效")
+    return img, (extract_title(md_text) or "文档") + f".{ext}"
 
 
 # 格式名 -> 处理函数, 页面通过它按格式分发, 扩展时在此登记即可

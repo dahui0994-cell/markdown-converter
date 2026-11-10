@@ -29,7 +29,7 @@ WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 # 当前可用格式(后端已实现的), 页面右栏据此渲染按钮
-AVAILABLE_FORMATS = ["pdf", "word"]
+AVAILABLE_FORMATS = ["pdf", "word", "png", "jpg"]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -39,8 +39,7 @@ def index():
 
 @app.get("/api/formats")
 def formats():
-    return {"available": AVAILABLE_FORMATS,
-            "planned": ["word", "jpg", "png"]}
+    return {"available": AVAILABLE_FORMATS, "planned": []}
 
 
 @app.get("/api/sample")
