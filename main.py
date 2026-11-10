@@ -58,10 +58,19 @@ def html_preview(md: str = ""):
     }
 
 
+@app.get("/api/ppt-templates")
+def ppt_templates():
+    """PPT 可选模板列表(供页面渲染模板卡片)。"""
+    return {"templates": [
+        {"key": k, "name": v["name"], "bg": v["bg"], "accent": v["accent"]}
+        for k, v in renderer.PPT_TEMPLATES.items()
+    ], "default": renderer.PPT_DEFAULT_TEMPLATE}
+
+
 @app.post("/api/convert")
-def convert(md: str = Form(...), format: str = Form("pdf")):
+def convert(md: str = Form(...), format: str = Form("pdf"), template: str = Form("")):
     """右栏「下载」按钮: 按格式转换并返回文件。同步端点(线程池), 避免
-    Playwright 同步 API 与 asyncio 冲突。"""
+    Playwright 同步 API 与 asyncio 冲突。template 仅 PPT 生效(配色模板)。"""
     if not md.strip():
         raise HTTPException(400, "Markdown 内容为空")
     if format not in AVAILABLE_FORMATS:
@@ -69,7 +78,10 @@ def convert(md: str = Form(...), format: str = Form("pdf")):
     if format not in renderer.FORMATS:
         raise HTTPException(501, "该格式尚未实现")
     try:
-        data, filename = renderer.FORMATS[format](md)
+        if format == "pptx":
+            data, filename = renderer.markdown_to_pptx(md, template or renderer.PPT_DEFAULT_TEMPLATE)
+        else:
+            data, filename = renderer.FORMATS[format](md)
     except NotImplementedError as e:
         raise HTTPException(501, str(e))
     except Exception as e:

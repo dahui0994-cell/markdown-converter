@@ -108,6 +108,31 @@
   #dl-status.ok { color: #1a7f37; }
   #dl-status.err { color: #d1242f; }
 
+  /* PPT 模板选择区(仅选中 PPT 时显示) */
+  .tpl-zone { margin-top: 18px; display: none; }
+  .tpl-zone.show { display: block; }
+  .tpl-label { font-size: 13px; font-weight: 700; color: #555; margin-bottom: 10px; }
+  .tpl-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  .tpl-item {
+    border: 2px solid #e3e8ef; border-radius: 10px; padding: 8px;
+    cursor: pointer; transition: all .15s; user-select: none;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .tpl-item:hover { border-color: #a8c4f0; }
+  .tpl-item.selected { border-color: #2f6feb; box-shadow: 0 0 0 2px rgba(47,111,235,.25); }
+  .tpl-sw { height: 44px; border-radius: 6px; border: 1px solid rgba(0,0,0,.08); position: relative; overflow: hidden; }
+  /* 缩略图: 模拟幻灯片版式(左侧竖条 + 标题线 + 要点条) */
+  .tpl-sw::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+    background: var(--acc);
+  }
+  .tpl-sw::after {
+    content: ""; position: absolute; left: 8px; top: 9px; width: 70%; height: 4px;
+    border-radius: 2px; background: var(--acc); opacity: .85;
+  }
+  .tpl-sw .ln { position: absolute; left: 8px; height: 3px; border-radius: 2px; background: rgba(0,0,0,.18); }
+  .tpl-item .tpl-name { font-size: 11px; font-weight: 700; color: #333; }
+
   /* 底栏 */
   .footer {
     background: #fff; padding: 8px 24px; font-size: 12px; color: #999;
@@ -150,6 +175,12 @@
     <div class="panel-body">
       <div class="fmt-label">选择格式</div>
       <div class="fmt-list" id="fmt-list"></div>
+
+      <!-- PPT 模板(仅选中 PPT 时显示) -->
+      <div class="tpl-zone" id="tpl-zone">
+        <div class="tpl-label">🎨 PPT 模板</div>
+        <div class="tpl-grid" id="tpl-grid"></div>
+      </div>
 
       <div class="download-zone">
         <button class="btn primary" id="btn-dl" style="width:100%">⬇ 下载 PDF</button>
@@ -201,6 +232,7 @@ async function doPreview() {
 }
 
 /* ---------- 右栏: 格式列表 ---------- */
+let selectedTpl = "business";
 async function loadFormats() {
   const r = await fetch("/api/formats");
   const d = await r.json();
@@ -221,10 +253,46 @@ async function loadFormats() {
       list.querySelectorAll(".fmt-item").forEach(x => x.classList.remove("selected"));
       div.classList.add("selected");
       $("btn-dl").textContent = "⬇ 下载 " + meta.name;
+      toggleTplZone();
     });
     list.appendChild(div);
   }
   $("btn-dl").textContent = "⬇ 下载 " + FMT_META[selectedFmt].name;
+  toggleTplZone();
+  loadPptTemplates();
+}
+
+/* 仅选中 PPT 时显示模板区 */
+function toggleTplZone() {
+  $("tpl-zone").classList.toggle("show", selectedFmt === "pptx");
+}
+
+/* 渲染 6 款 PPT 模板卡片(色块预览 + 名称, 点选切换) */
+async function loadPptTemplates() {
+  const r = await fetch("/api/ppt-templates");
+  const d = await r.json();
+  selectedTpl = d.default || "business";
+  const grid = $("tpl-grid");
+  grid.innerHTML = "";
+  for (const t of d.templates) {
+    const item = document.createElement("div");
+    item.className = "tpl-item" + (t.key === selectedTpl ? " selected" : "");
+    item.style.setProperty("--acc", t.accent);
+    // 缩略图: 背景=模板底色, 强调色做竖条/标题线, 两条要点用中性色
+    item.innerHTML = `
+      <div class="tpl-sw" style="background:${t.bg}">
+        <span class="ln" style="top:20px; width:80%"></span>
+        <span class="ln" style="top:27px; width:60%"></span>
+        <span class="ln" style="top:34px; width:70%"></span>
+      </div>
+      <div class="tpl-name">${t.name}</div>`;
+    item.addEventListener("click", () => {
+      selectedTpl = t.key;
+      grid.querySelectorAll(".tpl-item").forEach(x => x.classList.remove("selected"));
+      item.classList.add("selected");
+    });
+    grid.appendChild(item);
+  }
 }
 
 /* ---------- 顶栏状态 ---------- */
@@ -261,6 +329,7 @@ $("btn-dl").addEventListener("click", async () => {
   btn.disabled = true; st.textContent = "正在生成 " + FMT_META[selectedFmt].name + "，请稍候……"; st.className = "";
   const form = new FormData();
   form.append("md", md); form.append("format", selectedFmt);
+  if (selectedFmt === "pptx") form.append("template", selectedTpl);
   try {
     const res = await fetch("/api/convert", { method: "POST", body: form });
     if (!res.ok) {

@@ -210,6 +210,20 @@ def step2_page_and_api() -> None:
     assert client.get("/health").json()["status"] == "ok"
     print("[OK] 24. /health 正常")
 
+    # /api/ppt-templates: 6 款模板 + 默认值
+    d = client.get("/api/ppt-templates").json()
+    assert len(d["templates"]) == 6, f"PPT 模板应 6 款, 实际 {len(d['templates'])}"
+    assert d["default"] in [t["key"] for t in d["templates"]]
+    assert all(k for t in d["templates"] for k in ("key", "name", "bg", "accent"))
+    print(f"[OK] 25. /api/ppt-templates 返回 {len(d['templates'])} 款模板, 默认 {d['default']}")
+
+    # 页面含 PPT 模板区(仅选 PPT 时显示) + 下载带 template 字段
+    page_css = client.get("/").text
+    assert 'id="tpl-zone"' in page_css and "tpl-grid" in page_css, "页面缺 PPT 模板区"
+    assert "toggleTplZone" in page_css, "缺模板区显隐逻辑"
+    assert 'form.append("template"' in page_css, "下载未携带 template 字段"
+    print("[OK] 26. 页面含 PPT 模板区, 选中 PPT 时显示, 下载携带 template")
+
 
 def main() -> int:
     step1_pdf_core()

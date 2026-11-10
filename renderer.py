@@ -438,12 +438,46 @@ def _markdown_to_image(md_text: str, fmt: str) -> tuple[bytes, str]:
 #   列表/段落/代码/表格 -> 归入当前内容页要点; 要点过多自动拆「(续)」页
 # ---------------------------------------------------------------------------
 
-PPT_ACCENT = PptRGB(0x2F, 0x6F, 0xEB)   # 蓝 #2f6feb
-PPT_DARK = PptRGB(0x24, 0x29, 0x2F)     # 深灰 #24292f
-PPT_GRAY = PptRGB(0x8A, 0x8F, 0x98)     # 页脚灰
-PPT_LIGHT = PptRGB(0xF0, 0xF5, 0xFF)    # 浅蓝底
 PPT_CJK = "Microsoft YaHei"
 _PPT_MAX_BULLETS = 7
+
+
+def _hex(rgb: str) -> PptRGB:
+    h = rgb.lstrip("#")
+    return PptRGB(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+# 6 款 PPT 模板: 同一版式, 不同配色。key -> 颜色组。
+# name 为展示名(不参与转 RGB), 其余为 16 进制色值。
+PPT_TEMPLATES: dict[str, dict] = {
+    "business":  {"name": "简约商务", "bg": "#FFFFFF", "title": "#1A1A1A",
+                  "body": "#24292F", "accent": "#2F6FEB", "footer": "#8A8F98",
+                  "subtitle": "#8A8F98"},
+    "tech":      {"name": "科技深蓝", "bg": "#0F1B2D", "title": "#FFFFFF",
+                  "body": "#E6F0FA", "accent": "#4FC3F7", "footer": "#7C8CA0",
+                  "subtitle": "#9FB6CC"},
+    "orange":    {"name": "活力橙",   "bg": "#FFF8F0", "title": "#3A2A1E",
+                  "body": "#4A3B30", "accent": "#E8613C", "footer": "#B0988A",
+                  "subtitle": "#B0988A"},
+    "green":     {"name": "清新绿",   "bg": "#FFFFFF", "title": "#1F3D2E",
+                  "body": "#2E3D36", "accent": "#2E9E5B", "footer": "#8A9A90",
+                  "subtitle": "#8A9A90"},
+    "blackgold": {"name": "黑金尊享", "bg": "#141414", "title": "#FFFFFF",
+                  "body": "#E8E2D0", "accent": "#D4AF37", "footer": "#8A8A8A",
+                  "subtitle": "#B8B8B8"},
+    "purple":    {"name": "创意紫",   "bg": "#FFFFFF", "title": "#2A2140",
+                  "body": "#33303F", "accent": "#7C4DFF", "footer": "#9A94B0",
+                  "subtitle": "#9A94B0"},
+}
+PPT_DEFAULT_TEMPLATE = "business"
+# 兜底颜色(模板解析失败时)
+PPT_DEFAULT = _hex("#24292F")
+
+
+def _ppt_theme(key: str | None) -> dict:
+    """把模板 key 解析成 {颜色名: RGB} (去掉展示名 name)。未知 key 回退默认。"""
+    raw = PPT_TEMPLATES.get(key or PPT_DEFAULT_TEMPLATE, PPT_TEMPLATES[PPT_DEFAULT_TEMPLATE])
+    return {k: _hex(v) for k, v in raw.items() if k != "name"}
 
 
 def _ppt_strip_inline(text: str) -> str:
@@ -456,8 +490,13 @@ def _ppt_strip_inline(text: str) -> str:
 
 
 def _ppt_set_run(run, text: str, size: int, bold: bool = False,
-                 color: PptRGB = PPT_DARK, italic: bool = False):
-    """往 run 写文本并统一中文字体(微软雅黑, 含东亚字体)。"""
+                 color=None, italic: bool = False, theme: dict | None = None):
+    """往 run 写文本并统一中文字体(微软雅黑, 含东亚字体)。
+
+    color 缺省取 theme['body']。
+    """
+    if color is None:
+        color = theme.get("body") if theme else PPT_DEFAULT
     run.text = text
     run.font.size = PptPt(size)
     run.font.bold = bold
@@ -583,7 +622,11 @@ def _ppt_add_textbox(slide, left, top, width, height):
     return slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
 
 
-def _ppt_build(slides: list[dict]) -> bytes:
+def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> bytes:
+    theme = _ppt_theme(template)
+    bg, accent = theme["bg"], theme["accent"]
+    title_c, foot_c, sub_c = theme["title"], theme["footer"], theme["subtitle"]
+
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -593,45 +636,49 @@ def _ppt_build(slides: list[dict]) -> bytes:
     for num, s in enumerate(slides, start=1):
         slide = prs.slides.add_slide(blank)
 
-        # 页码(右下角, 封面除外)
+        # 整页背景色(按模板)
+        slide.background.fill.solid()
+        slide.background.fill.fore_color.rgb = bg
+
+        # 页码(右下角, 封面除外), 颜色随模板页脚色
         if s["kind"] != "cover":
             tb = _ppt_add_textbox(slide, 12.4, 7.0, 0.7, 0.3)
             p = tb.text_frame.paragraphs[0]
             p.alignment = PP_ALIGN.RIGHT
-            _ppt_set_run(p.add_run(), str(num), 12, color=PPT_GRAY)
+            _ppt_set_run(p.add_run(), str(num), 12, color=foot_c)
 
         if s["kind"] == "cover":
             # 左侧强调竖条
             bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.0), Inches(0.0), Inches(0.18), Inches(7.5))
-            bar.fill.solid(); bar.fill.fore_color.rgb = PPT_ACCENT
+            bar.fill.solid(); bar.fill.fore_color.rgb = accent
             bar.line.fill.background()
             tb = _ppt_add_textbox(slide, 1.0, 2.7, 11.3, 1.6)
             p = tb.text_frame.paragraphs[0]; p.alignment = PP_ALIGN.LEFT
-            _ppt_set_run(p.add_run(), s["title"] or "演示文稿", 44, bold=True, color=PPT_DARK)
+            _ppt_set_run(p.add_run(), s["title"] or "演示文稿", 44, bold=True, color=title_c)
             if s.get("subtitle"):
                 tb2 = _ppt_add_textbox(slide, 1.0, 4.3, 11.3, 0.7)
                 p2 = tb2.text_frame.paragraphs[0]
-                _ppt_set_run(p2.add_run(), s["subtitle"], 22, color=PPT_GRAY)
+                _ppt_set_run(p2.add_run(), s["subtitle"], 22, color=sub_c)
             tb3 = _ppt_add_textbox(slide, 1.0, 6.4, 11.3, 0.5)
             p3 = tb3.text_frame.paragraphs[0]
-            _ppt_set_run(p3.add_run(), date.today().strftime("%Y / %m / %d"), 16, color=PPT_GRAY)
+            _ppt_set_run(p3.add_run(), date.today().strftime("%Y / %m / %d"), 16, color=foot_c)
 
         elif s["kind"] == "section":
             tb = _ppt_add_textbox(slide, 1.0, 3.0, 11.3, 1.4)
             p = tb.text_frame.paragraphs[0]; p.alignment = PP_ALIGN.CENTER
-            _ppt_set_run(p.add_run(), s["title"], 40, bold=True, color=PPT_DARK)
+            _ppt_set_run(p.add_run(), s["title"], 40, bold=True, color=title_c)
             bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(5.667), Inches(4.4), Inches(2.0), Inches(0.06))
-            bar.fill.solid(); bar.fill.fore_color.rgb = PPT_ACCENT
+            bar.fill.solid(); bar.fill.fore_color.rgb = accent
             bar.line.fill.background()
 
         else:  # content
             # 标题
             tb = _ppt_add_textbox(slide, 0.7, 0.5, 11.9, 0.9)
             p = tb.text_frame.paragraphs[0]
-            _ppt_set_run(p.add_run(), s["title"], 30, bold=True, color=PPT_DARK)
+            _ppt_set_run(p.add_run(), s["title"], 30, bold=True, color=title_c)
             # 标题下强调短线
             bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.75), Inches(1.45), Inches(1.6), Inches(0.07))
-            bar.fill.solid(); bar.fill.fore_color.rgb = PPT_ACCENT
+            bar.fill.solid(); bar.fill.fore_color.rgb = accent
             bar.line.fill.background()
             # 要点
             bullets = s["bullets"]
@@ -644,17 +691,19 @@ def _ppt_build(slides: list[dict]) -> bytes:
                     para = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
                     para.space_after = PptPt(10)
                     para.line_spacing = 1.1
-                    _ppt_set_run(para.add_run(), b, size, color=PPT_DARK)
+                    _ppt_set_run(para.add_run(), b, size, color=theme["body"])
 
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue()
 
 
-def markdown_to_pptx(md_text: str) -> tuple[bytes, str]:
-    """Markdown -> PPT(.pptx), 返回 (pptx 字节, 建议文件名)。"""
+def markdown_to_pptx(md_text: str, template: str = PPT_DEFAULT_TEMPLATE) -> tuple[bytes, str]:
+    """Markdown -> PPT(.pptx), 返回 (pptx 字节, 建议文件名)。template 指定配色模板。"""
+    if template not in PPT_TEMPLATES:
+        template = PPT_DEFAULT_TEMPLATE
     slides = _ppt_parse(md_text)
-    data = _ppt_build(slides)
+    data = _ppt_build(slides, template)
     if not data.startswith(b"PK"):
         raise RuntimeError("生成的 pptx 无效")
     return data, (extract_title(md_text) or "演示文稿") + ".pptx"

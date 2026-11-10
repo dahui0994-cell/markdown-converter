@@ -12,7 +12,8 @@
 - **PDF 排版**：微软雅黑字体、段落首行缩进、层级标题、表格隔行变色、代码块灰底圆角、
   引用块蓝边浅底、代码块/表格避免跨页断裂
 - **Word (.docx)**：标题/列表/表格/代码块/引用结构化导出，中文统一微软雅黑，可再编辑
-- **PPT (.pptx)**：大纲转幻灯片，`#` 作封面/分节、`##` 作内容页，自动分页 + 页码，简约商务风
+- **PPT (.pptx)**：大纲转幻灯片，`#` 作封面/分节、`##` 作内容页，自动分页 + 页码；
+  内置 6 款配色模板（简约商务/科技深蓝/活力橙/清新绿/黑金尊享/创意紫），选中 PPT 后在右栏挑选
 - **PNG / JPG**：渲染为一张排版好的长图，适合分享
 - 纯本地运行，数据不出本机；PDF/PNG/JPG 用本机 Microsoft Edge 无头渲染，无需额外下载浏览器
 
@@ -39,7 +40,7 @@ uvicorn main:app --host 127.0.0.1 --port 8000
 python verify.py
 ```
 
-一次跑 24 项检查（PDF/Word/PPT/PNG/JPG 渲染核心 + 三板块页面 + 全部 API 接口）。
+一次跑 26 项检查（PDF/Word/PPT/PNG/JPG 渲染核心 + 三板块页面 + 全部 API + PPT 模板选择）。
 
 ## 目录结构
 
@@ -58,7 +59,7 @@ requirements.txt # 依赖
 | ---- | ---- | ---- |
 | PDF  | `.pdf`   | 排版美观，A4 分页，适合打印/归档 |
 | Word | `.docx`  | 结构化可再编辑，中文微软雅黑 |
-| PPT  | `.pptx`  | 大纲转幻灯片，封面+分节+内容页，带页码 |
+| PPT  | `.pptx`  | 大纲转幻灯片，封面+分节+内容页，带页码，6 款配色模板 |
 | PNG  | `.png`   | 长图，透明无损，适合分享 |
 | JPG  | `.jpg`   | 长图，体积小，适合分享 |
 
@@ -67,8 +68,9 @@ requirements.txt # 依赖
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
 | GET  | `/` | 中文操作页面 |
-| POST | `/api/convert` | 表单 `md` + `format`(pdf/word/pptx/png/jpg) → 下载文件 |
+| POST | `/api/convert` | 表单 `md` + `format`(pdf/word/pptx/png/jpg) [+ `template` 仅 PPT] → 下载文件 |
 | GET  | `/api/html-preview` | 中栏实时预览用 |
 | GET  | `/api/formats` | 可用格式列表 |
+| GET  | `/api/ppt-templates` | PPT 可选配色模板列表 |
 | GET  | `/api/sample` | 示例 Markdown |
 | GET  | `/health` | 健康检查 |
