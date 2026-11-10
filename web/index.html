@@ -159,7 +159,7 @@
   </div>
 </div>
 
-<div class="footer">本地服务 · 数据不出本机 · PDF / Word / PNG / JPG 已支持</div>
+<div class="footer">本地服务 · 数据不出本机 · PDF / Word / PPT / PNG / JPG 已支持</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -168,6 +168,7 @@ let available = [];
 const FMT_META = {
   pdf:  { icon: "📕", name: "PDF",  desc: "已支持，排版美观" },
   word: { icon: "📘", name: "Word", desc: "已支持，可再编辑" },
+  pptx: { icon: "📙", name: "PPT",  desc: "已支持，大纲变幻灯片" },
   jpg:  { icon: "🖼️", name: "JPG",  desc: "已支持，长图分享" },
   png:  { icon: "🖼️", name: "PNG",  desc: "已支持，透明无损" },
 };
@@ -206,7 +207,7 @@ async function loadFormats() {
   available = d.available;
   const list = $("fmt-list");
   list.innerHTML = "";
-  for (const key of ["pdf","word","jpg","png"]) {
+  for (const key of ["pdf","word","pptx","jpg","png"]) {
     const meta = FMT_META[key];
     const ok = available.includes(key);
     const div = document.createElement("div");

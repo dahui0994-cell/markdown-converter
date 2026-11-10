@@ -15,6 +15,11 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor
 from playwright.sync_api import sync_playwright
+from pptx import Presentation
+from pptx.dml.color import RGBColor as PptRGB
+from pptx.enum.shapes import MSO_SHAPE
+from pptx.enum.text import PP_ALIGN
+from pptx.util import Inches, Pt as PptPt
 
 # 单一事实来源: 所有输出(PDF/预览)共用这一套样式, 保证所见即所得
 LAYOUT_CSS = """
@@ -426,10 +431,240 @@ def _markdown_to_image(md_text: str, fmt: str) -> tuple[bytes, str]:
     return img, (extract_title(md_text) or "文档") + f".{ext}"
 
 
+# ---------------------------------------------------------------------------
+# PPT 导出: 把 Markdown 大纲转成 16:9 演示文稿(简约商务风, 白底深灰字蓝色强调)。
+#   # 一级标题  -> 首个作封面页(标题+副标题+日期), 其后作分节页
+#   ## 二级标题 -> 内容页(标题 + 要点)
+#   列表/段落/代码/表格 -> 归入当前内容页要点; 要点过多自动拆「(续)」页
+# ---------------------------------------------------------------------------
+
+PPT_ACCENT = PptRGB(0x2F, 0x6F, 0xEB)   # 蓝 #2f6feb
+PPT_DARK = PptRGB(0x24, 0x29, 0x2F)     # 深灰 #24292f
+PPT_GRAY = PptRGB(0x8A, 0x8F, 0x98)     # 页脚灰
+PPT_LIGHT = PptRGB(0xF0, 0xF5, 0xFF)    # 浅蓝底
+PPT_CJK = "Microsoft YaHei"
+_PPT_MAX_BULLETS = 7
+
+
+def _ppt_strip_inline(text: str) -> str:
+    """去掉行内 Markdown 标记, 取纯文本。"""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"`(.+?)`", r"\1", text)
+    text = re.sub(r"\[(.+?)\]\((.+?)\)", r"\1", text)
+    return text.strip()
+
+
+def _ppt_set_run(run, text: str, size: int, bold: bool = False,
+                 color: PptRGB = PPT_DARK, italic: bool = False):
+    """往 run 写文本并统一中文字体(微软雅黑, 含东亚字体)。"""
+    run.text = text
+    run.font.size = PptPt(size)
+    run.font.bold = bold
+    run.font.italic = italic
+    run.font.color.rgb = color
+    run.font.name = PPT_CJK
+    # 东亚字体需单独设置, 否则中文可能落到默认字体
+    rPr = run._r.get_or_add_rPr()
+    from pptx.oxml.ns import qn as _pq
+    ea = rPr.find(_pq("a:ea"))
+    if ea is None:
+        ea = rPr.makeelement(_pq("a:ea"), {})
+        rPr.append(ea)
+    ea.set("typeface", PPT_CJK)
+
+
+def _ppt_parse(md_text: str) -> list[dict]:
+    """解析 Markdown 为幻灯片结构列表。"""
+    lines = md_text.splitlines()
+    slides: list[dict] = []
+    i, n = 0, len(lines)
+    cover_seen = False
+
+    def last_content() -> dict | None:
+        return slides[-1] if slides and slides[-1]["kind"] == "content" else None
+
+    def ensure_content(title: str) -> dict:
+        cur = last_content()
+        if cur:
+            return cur
+        s = {"kind": "content", "title": title, "bullets": []}
+        slides.append(s)
+        return s
+
+    while i < n:
+        raw = lines[i]
+        stripped = raw.strip()
+
+        # 代码块: 作为一条要点
+        if stripped.startswith("```"):
+            i += 1
+            code = []
+            while i < n and not lines[i].strip().startswith("```"):
+                code.append(lines[i].rstrip())
+                i += 1
+            snippet = "  ".join(c.strip() for c in code if c.strip())
+            if snippet:
+                ensure_content(slides[-1]["title"] if slides else "内容")["bullets"].append("» " + snippet[:80])
+            continue
+
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            level = len(m.group(1))
+            text = _ppt_strip_inline(m.group(2))
+            if level == 1:
+                if not cover_seen:
+                    slides.append({"kind": "cover", "title": text, "subtitle": "", "date": ""})
+                    cover_seen = True
+                    i += 1
+                    continue
+                else:
+                    slides.append({"kind": "section", "title": text, "bullets": []})
+                    i += 1
+                    continue
+            # 二/三/四/五级标题 -> 内容页
+            s = {"kind": "content", "title": text, "bullets": []}
+            slides.append(s)
+            i += 1
+            continue
+
+        # 空行
+        if not stripped:
+            i += 1
+            continue
+
+        # 表格: 取表头做要点
+        if stripped.startswith("|") and i + 1 < n and re.match(r"^\|[\s\-:|]+\|$", lines[i + 1].strip()):
+            header = [c.strip() for c in stripped.strip("|").split("|")]
+            ensure_content("内容")["bullets"].append("· " + "  |  ".join(h for h in header if h))
+            i += 2
+            continue
+
+        # 列表 / 引用 / 普通段落 -> 要点
+        m_li = re.match(r"^\s*([-*+]|\d+\.)\s+(.*)$", raw)
+        if m_li:
+            depth = len(raw) - len(raw.lstrip())
+            txt = _ppt_strip_inline(m_li.group(2))
+            indent = "   " * min(depth // 2, 2)
+            ensure_content("内容")["bullets"].append(indent + "• " + txt)
+            i += 1
+            continue
+        m_q = re.match(r"^>\s*(.*)$", stripped)
+        if m_q:
+            ensure_content("内容")["bullets"].append("‖ " + _ppt_strip_inline(m_q.group(1)))
+            i += 1
+            continue
+        ensure_content("内容")["bullets"].append(_ppt_strip_inline(stripped))
+        i += 1
+
+    # 封面副标题: 取封面后、第一个标题前的第一段正文
+    if cover_seen and slides and slides[0]["kind"] == "cover":
+        for s in slides[1:]:
+            if s["kind"] == "content":
+                if s["bullets"]:
+                    slides[0]["subtitle"] = s["bullets"][0].lstrip("• ‖ »  ").strip()
+                break
+
+    # 拆分要点过多的内容页
+    out: list[dict] = []
+    for s in slides:
+        if s["kind"] != "content":
+            out.append(s)
+            continue
+        bullets = s["bullets"]
+        chunks = [bullets[k:k + _PPT_MAX_BULLETS] for k in range(0, len(bullets), _PPT_MAX_BULLETS)] or [[]]
+        for idx, chunk in enumerate(chunks):
+            title = s["title"] if idx == 0 else f"{s['title']}（续）"
+            out.append({"kind": "content", "title": title, "bullets": chunk})
+    return out
+
+
+def _ppt_add_textbox(slide, left, top, width, height):
+    return slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+
+
+def _ppt_build(slides: list[dict]) -> bytes:
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]
+    from datetime import date
+
+    for num, s in enumerate(slides, start=1):
+        slide = prs.slides.add_slide(blank)
+
+        # 页码(右下角, 封面除外)
+        if s["kind"] != "cover":
+            tb = _ppt_add_textbox(slide, 12.4, 7.0, 0.7, 0.3)
+            p = tb.text_frame.paragraphs[0]
+            p.alignment = PP_ALIGN.RIGHT
+            _ppt_set_run(p.add_run(), str(num), 12, color=PPT_GRAY)
+
+        if s["kind"] == "cover":
+            # 左侧强调竖条
+            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.0), Inches(0.0), Inches(0.18), Inches(7.5))
+            bar.fill.solid(); bar.fill.fore_color.rgb = PPT_ACCENT
+            bar.line.fill.background()
+            tb = _ppt_add_textbox(slide, 1.0, 2.7, 11.3, 1.6)
+            p = tb.text_frame.paragraphs[0]; p.alignment = PP_ALIGN.LEFT
+            _ppt_set_run(p.add_run(), s["title"] or "演示文稿", 44, bold=True, color=PPT_DARK)
+            if s.get("subtitle"):
+                tb2 = _ppt_add_textbox(slide, 1.0, 4.3, 11.3, 0.7)
+                p2 = tb2.text_frame.paragraphs[0]
+                _ppt_set_run(p2.add_run(), s["subtitle"], 22, color=PPT_GRAY)
+            tb3 = _ppt_add_textbox(slide, 1.0, 6.4, 11.3, 0.5)
+            p3 = tb3.text_frame.paragraphs[0]
+            _ppt_set_run(p3.add_run(), date.today().strftime("%Y / %m / %d"), 16, color=PPT_GRAY)
+
+        elif s["kind"] == "section":
+            tb = _ppt_add_textbox(slide, 1.0, 3.0, 11.3, 1.4)
+            p = tb.text_frame.paragraphs[0]; p.alignment = PP_ALIGN.CENTER
+            _ppt_set_run(p.add_run(), s["title"], 40, bold=True, color=PPT_DARK)
+            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(5.667), Inches(4.4), Inches(2.0), Inches(0.06))
+            bar.fill.solid(); bar.fill.fore_color.rgb = PPT_ACCENT
+            bar.line.fill.background()
+
+        else:  # content
+            # 标题
+            tb = _ppt_add_textbox(slide, 0.7, 0.5, 11.9, 0.9)
+            p = tb.text_frame.paragraphs[0]
+            _ppt_set_run(p.add_run(), s["title"], 30, bold=True, color=PPT_DARK)
+            # 标题下强调短线
+            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.75), Inches(1.45), Inches(1.6), Inches(0.07))
+            bar.fill.solid(); bar.fill.fore_color.rgb = PPT_ACCENT
+            bar.line.fill.background()
+            # 要点
+            bullets = s["bullets"]
+            if bullets:
+                bt = _ppt_add_textbox(slide, 0.9, 1.9, 11.4, 5.0)
+                tf = bt.text_frame
+                tf.word_wrap = True
+                size = 20 if len(bullets) <= 5 else 18
+                for j, b in enumerate(bullets):
+                    para = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                    para.space_after = PptPt(10)
+                    para.line_spacing = 1.1
+                    _ppt_set_run(para.add_run(), b, size, color=PPT_DARK)
+
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def markdown_to_pptx(md_text: str) -> tuple[bytes, str]:
+    """Markdown -> PPT(.pptx), 返回 (pptx 字节, 建议文件名)。"""
+    slides = _ppt_parse(md_text)
+    data = _ppt_build(slides)
+    if not data.startswith(b"PK"):
+        raise RuntimeError("生成的 pptx 无效")
+    return data, (extract_title(md_text) or "演示文稿") + ".pptx"
+
+
 # 格式名 -> 处理函数, 页面通过它按格式分发, 扩展时在此登记即可
 FORMATS: dict[str, object] = {
     "pdf": markdown_to_pdf,
     "word": markdown_to_word,
     "jpg": markdown_to_jpg,
     "png": markdown_to_png,
+    "pptx": markdown_to_pptx,
 }
