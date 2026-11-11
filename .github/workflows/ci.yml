@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 本机无 Edge, PDF/PNG/JPG 走 Playwright Chromium 回退路径
+      - name: Install Chromium + system deps
+        run: playwright install --with-deps chromium
+
+      # Linux 默认无中文字体, 补装 Noto CJK 保证中文渲染不出豆腐块
+      - name: Install CJK fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+
+      - name: Run verification (26 checks)
+        run: python verify.py
