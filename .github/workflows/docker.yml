@@ -1,0 +1,52 @@
+name: Docker build check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "requirements.txt"
+      - "main.py"
+      - "renderer.py"
+      - "web/**"
+      - "assets/**"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "requirements.txt"
+      - "main.py"
+      - "renderer.py"
+      - "web/**"
+      - "assets/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 只构建不推送: 校验 Dockerfile 语法/依赖安装/字体安装是否成功
+      - name: Build image
+        run: docker build -t md-converter:check .
+
+      # 构建出镜像后冒烟: 起容器, 等健康检查通过, 打一个含 mermaid 的 PDF
+      - name: Smoke test container
+        run: |
+          docker run -d -p 8000:8000 --name md-smoke md-converter:check
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health
+          echo "=== health OK, 转换冒烟 ==="
+          printf '# 冒烟\n\n```mermaid\ngraph LR\nA --> B\n```\n' > /tmp/smoke.md
+          curl -fsS -X POST http://127.0.0.1:8000/api/convert \
+            -F "md=$(cat /tmp/smoke.md)" -F format=pdf -o /tmp/out.pdf
+          head -c 4 /tmp/out.pdf; echo
+          docker logs md-smoke 2>&1 | tail -5
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f md-smoke || true

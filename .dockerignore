@@ -1,0 +1,14 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+output/
+.venv/
+venv/
+*.log
+# 发布材料(非运行所需)
+cover.png
+cover_design.html
+公众号总结.md
+# 容器里不需要 verify, 但保留 verify.py 无害; 仅排除本地测试垃圾
+_test*.py

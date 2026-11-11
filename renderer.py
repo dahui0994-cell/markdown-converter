@@ -10,6 +10,7 @@ import atexit
 import contextlib
 import html as _html
 import io
+import os
 import queue
 import re
 import struct
@@ -323,10 +324,12 @@ import threading
 
 
 def _new_browser(pw):
+    # BROWSER_EXTRA_ARGS 可注入浏览器启动参数(如容器里设 --no-sandbox)
+    extra = os.environ.get("BROWSER_EXTRA_ARGS", "").split()
     try:
-        return pw.chromium.launch(channel="msedge", headless=True)
+        return pw.chromium.launch(channel="msedge", headless=True, args=extra or None)
     except Exception:
-        return pw.chromium.launch(headless=True)
+        return pw.chromium.launch(headless=True, args=extra or None)
 
 
 def _is_browser_fatal(err: BaseException) -> bool:

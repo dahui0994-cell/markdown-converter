@@ -107,6 +107,27 @@ PDF / PNG / JPG / mermaid 都靠无头浏览器出图。若每次转换都冷启
 
    已装 Edge 的机器可跳过此步，工具会优先使用本机 Edge。
 
+### Docker 部署（可选）
+
+没有 Python 环境也可以直接跑容器（镜像内置 Playwright Chromium + Noto CJK 字体 + 离线 mermaid.js）：
+
+```bash
+# 构建
+docker build -t md-converter .
+
+# 运行(宿主机 8000 映射到容器 8000)
+docker run -d --name md-converter -p 8000:8000 md-converter
+```
+
+浏览器打开 **http://localhost:8000** 即可使用。说明：
+
+- 容器内无 Edge，PDF/PNG/JPG 自动走 **Playwright Chromium 回退**（镜像已装好，无需再执行任何命令）；
+- 内置 `HEALTHCHECK`，`docker ps` 里状态为 `healthy` 即服务就绪；
+- 以非 root 用户运行（`--no-sandbox` 已内置，普通 Docker 环境直接可用；
+  如需自定义浏览器参数，可覆盖 `BROWSER_EXTRA_ARGS` 环境变量）；
+- GitHub Actions 有 **Docker build check** 工作流，每次改动 Dockerfile 自动构建 +
+  起容器 + 健康检查 + mermaid PDF 转换冒烟，保证镜像始终可用。
+
 ## 四、使用方法
 
 ### 启动服务
@@ -200,9 +221,12 @@ make_backgrounds.py# 生成 6 款 PPT 背景图（assets/ppt_bg/*.png）
 web/index.html     # 中文三板块页面（左输入 / 中预览 / 右格式+下载，含 mermaid 预览）
 verify.py          # 一键验证脚本
 sample.md          # 示例 Markdown（含 mermaid 流程图）
+test_sample.md     # 二次开发验收文档（5 种图型 + 未闭合围栏边界）
 requirements.txt   # 依赖
 assets/ppt_bg/     # 6 款 PPT 背景图（PNG）
 assets/js/         # 本地离线 mermaid.min.js（流程图渲染，不引外部 CDN）
+Dockerfile         # 容器镜像（内置 Chromium + Noto CJK 字体）
+.github/workflows/ # CI 自动验证(33 项) + Docker 构建冒烟检查
 output/            # 验证脚本产出的样例文件（可删）
 LICENSE            # MIT 许可证
 ```
