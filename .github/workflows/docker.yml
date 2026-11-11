@@ -20,6 +20,7 @@ on:
       - "renderer.py"
       - "web/**"
       - "assets/**"
+  workflow_dispatch:   # 手动触发(改 workflow 本身时 paths 不匹配, 用它补跑)
 
 jobs:
   build:
