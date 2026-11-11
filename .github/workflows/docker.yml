@@ -31,21 +31,34 @@ jobs:
       - name: Build image
         run: docker build -t md-converter:check .
 
-      # 构建出镜像后冒烟: 起容器, 等健康检查通过, 打一个含 mermaid 的 PDF
+      # 构建出镜像后冒烟: 起容器, 等 /health 就绪, 打一个含 mermaid 的 PDF。
+      # 用 8899 避开 runner 上可能的端口占用; 任何一步失败都先 dump 容器日志便于定位。
       - name: Smoke test container
+        env:
+          HOST_PORT: "8899"
         run: |
-          docker run -d -p 8000:8000 --name md-smoke md-converter:check
+          set -u
+          docker run -d -p "$HOST_PORT":8000 --name md-smoke md-converter:check
+
+          dump() {
+            echo "=== 容器状态 ==="; docker ps -a --filter name=md-smoke
+            echo "=== 容器日志(最后 40 行) ==="; docker logs md-smoke 2>&1 | tail -40 || true
+          }
+
+          ok=""
           for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then break; fi
+            if curl -fsS "http://127.0.0.1:$HOST_PORT/health" >/dev/null 2>&1; then ok=1; break; fi
             sleep 2
           done
-          curl -fsS http://127.0.0.1:8000/health
-          echo "=== health OK, 转换冒烟 ==="
+          if [ -z "$ok" ]; then dump; exit 1; fi
+          echo "=== health OK, 开始转换冒烟 ==="
+
           printf '# 冒烟\n\n```mermaid\ngraph LR\nA --> B\n```\n' > /tmp/smoke.md
-          curl -fsS -X POST http://127.0.0.1:8000/api/convert \
-            -F "md=$(cat /tmp/smoke.md)" -F format=pdf -o /tmp/out.pdf
-          head -c 4 /tmp/out.pdf; echo
-          docker logs md-smoke 2>&1 | tail -5
+          if ! curl -fsS -X POST "http://127.0.0.1:$HOST_PORT/api/convert" \
+              -F "md=$(cat /tmp/smoke.md)" -F format=pdf -o /tmp/out.pdf; then
+            dump; exit 1
+          fi
+          head -c 4 /tmp/out.pdf | grep -q '%PDF' && echo "=== PDF 冒烟通过 ===" || { dump; exit 1; }
 
       - name: Teardown
         if: always()
