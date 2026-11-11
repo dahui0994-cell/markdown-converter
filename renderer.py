@@ -6,8 +6,14 @@
 - PPT: 用 python-pptx 生成 .pptx, 支持 6 款配色模板(见 PPT_TEMPLATES)。
 """
 
+import atexit
+import contextlib
+import html as _html
 import io
+import queue
 import re
+import struct
+import threading
 from pathlib import Path
 from urllib.parse import quote
 
@@ -15,7 +21,7 @@ import markdown
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor
 from playwright.sync_api import sync_playwright
 from pptx import Presentation
 from pptx.dml.color import RGBColor as PptRGB
@@ -59,6 +65,18 @@ LAYOUT_CSS = """
   blockquote p { text-indent: 0; margin: 0.3em 0; }
   hr { border: none; border-top: 1px solid #d8d8d8; margin: 1.4em 0; }
   img { max-width: 100%; border-radius: 4px; margin: 0.4em 0; }
+  .mermaid-diagram { margin: 0.8em 0; text-align: center; page-break-inside: avoid; }
+  .mermaid-diagram svg { max-width: 100%; height: auto; }
+  /* 中栏预览: mermaid.js 懒加载 / 出图完成前, 占位框显示「图表渲染中…」,
+     用 text-indent 把源码文字顶出可视区, 避免把原始代码露出来造成「未识别」错觉 */
+  .mermaid-diagram.mermaid-loading { position: relative; min-height: 42px; overflow: hidden;
+        text-indent: 9999px; border: 1px dashed #c9d2dc; border-radius: 8px; background: #fafbfc; }
+  .mermaid-diagram.mermaid-loading::after { content: "图表渲染中…"; position: absolute;
+        left: 14px; top: 50%; transform: translateY(-50%); text-indent: 0;
+        color: #8a8f98; font-size: 12px; font-style: italic; }
+  .mermaid-error { background: #fff5f5; border: 1px solid #ffccc7; color: #d1242f;
+                   border-radius: 8px; padding: 10px 14px; font-size: 9pt;
+                   white-space: pre-wrap; margin: 0.8em 0; }
   a { color: #2f6feb; text-decoration: none; }
   strong { font-weight: 700; color: #1a1a1a; }
   h1, h2, h3 { page-break-after: avoid; }
@@ -76,18 +94,160 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </html>"""
 
 
+def _close_unterminated_fences(md_text: str) -> str:
+    """给未闭合的围栏代码块自动补上结尾 ```。
+
+    只处理「最后一个围栏行是无歧义开围栏(```语言名, 如 ```mermaid / ```python)
+    且其后没有任何裸 ``` 行」的情况; 已闭合、普通文本、裸 ``` 围栏一律不动。
+    避免用户漏写结尾 ``` 时, 整块退化为一串纯文本段落。"""
+    lines = md_text.split("\n")
+    fence_marks = [i for i, l in enumerate(lines) if re.match(r"^\s*```", l)]
+    if not fence_marks:
+        return md_text
+    last = fence_marks[-1]
+    last_line = lines[last]
+    # 开围栏特征: ``` 后紧跟非空白(语言名), 绝不可能是闭合行
+    if not re.match(r"^\s*```\S", last_line):
+        return md_text
+    # 其后已有裸 ```(闭合行) -> 已闭合, 不动
+    if any(re.match(r"^\s*```\s*$", t) for t in lines[last + 1:]):
+        return md_text
+    return md_text.rstrip("\n") + "\n```\n"
+
+
 def markdown_to_html_body(md_text: str) -> str:
-    """把 Markdown 转成渲染好的 HTML 正文(不含外壳), 预览与 PDF 共用。"""
+    """把 Markdown 转成渲染好的 HTML 正文(不含外壳), 预览与 PDF 共用。
+
+    先给漏写结尾 ``` 的围栏块自动补闭合, 再交给 markdown 库。"""
+    md_text = _close_unterminated_fences(md_text)
     return markdown.markdown(
         md_text,
         extensions=["tables", "fenced_code", "codehilite", "toc"],
     )
 
 
+def _has_mermaid(md_text: str) -> bool:
+    """Markdown 中是否含 ```mermaid 围栏代码块。"""
+    return bool(re.search(r"^\s*```mermaid", md_text, re.M))
+
+
+_MERMAID_RUN = """
+<script>
+window.addEventListener('load', function () {
+  mermaid.initialize({ startOnLoad: false, theme: 'default' });
+  var els = Array.prototype.slice.call(document.querySelectorAll('pre code.language-mermaid'));
+  if (!els.length) { window.__mm_done = true; return; }
+  var done = els.map(function (el, i) {
+    var div = document.createElement('div');
+    div.className = 'mermaid-diagram';
+    var src = el.textContent;                        // 浏览器已把 &gt; 等解码为源码文本
+    var pre = el.closest('pre');
+    if (pre)      pre.parentNode.replaceChild(div, pre);
+    else          el.parentNode.replaceChild(div, el);
+    var id = 'mm-' + i + '-' + Date.now();
+    return mermaid.render(id, src).then(function (res) {
+      div.innerHTML = res.svg;                     // v10: 解析结果是 {svg, bindFunctions}
+    }).catch(function (err) {
+      div.className = 'mermaid-error';
+      div.textContent = '[mermaid 渲染失败: ' + (err && err.message ? err.message : err) + ']';
+    });
+  });
+  Promise.all(done).then(function () { window.__mm_done = true; });
+  setTimeout(function () { window.__mm_done = true; }, 8000);   // 兜底, 防某图挂起卡死
+});
+</script>
+"""
+
+# 本地离线 mermaid.js(IIFE, UMD 暴露 window.mermaid), 只在含图时注入, 不发外部请求
+_MERMAID_FOOTER: str | None = None
+
+
+def _mermaid_footer() -> str:
+    global _MERMAID_FOOTER
+    if _MERMAID_FOOTER is None:
+        js_path = Path(__file__).parent / "assets" / "js" / "mermaid.min.js"
+        js = js_path.read_text(encoding="utf-8") if js_path.exists() else None
+        _MERMAID_FOOTER = (
+            "<script type='text/javascript'>\n" + (js or "") + "\n</script>\n" + _MERMAID_RUN
+        ) if js else ""
+    return _MERMAID_FOOTER
+
+
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    """读 PNG IHDR 宽高(像素)。非法 PNG 返回 None。"""
+    if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    return struct.unpack(">II", data[16:24])
+
+
+def _mermaid_sources(slides: list[dict]) -> list[str]:
+    """按页序收集所有内容页里的 mermaid 图块源码(供批量渲染, 顺序与版面插入一致)。"""
+    out: list[str] = []
+    for s in slides:
+        if s["kind"] != "content":
+            continue
+        for it in s["items"]:
+            if isinstance(it, dict) and it.get("type") == "mermaid":
+                out.append(it["src"])
+    return out
+
+
+def _mermaid_render_images(sources: list[str]) -> list[bytes | None]:
+    """mermaid 源码批量渲染成**透明底 PNG** 字节列表(一次无头浏览器会话)。
+
+    每张图渲染失败(语法错/mermaid.js 缺失)对应位置为 None, 由调用方兜底降级为文本。"""
+    if not sources:
+        return []
+    js_path = Path(__file__).parent / "assets" / "js" / "mermaid.min.js"
+    if not js_path.exists():
+        return [None] * len(sources)
+    js = js_path.read_text(encoding="utf-8")
+    blocks = "\n".join(
+        f'<div class="mm" data-idx="{i}">{_html.escape(src)}</div>'
+        for i, src in enumerate(sources)
+    )
+    page_html = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"><style>
+  body {{ margin: 0; background: #fff; }}
+  .mm {{ margin: 24px; padding: 8px; }}
+  .mm svg {{ max-width: 640px; height: auto; }}
+  .mm-error {{ color: #d1242f; font-size: 12px; white-space: pre-wrap; }}
+</style></head>
+<body>
+{blocks}
+<script type="text/javascript">
+{js}
+window.addEventListener("load", function () {{
+  mermaid.initialize({{ startOnLoad: false, theme: "default" }});
+  var nodes = Array.prototype.slice.call(document.querySelectorAll(".mm"));
+  var jobs = nodes.map(function (el, i) {{
+    var id = "pmt-" + i + "-" + Date.now();
+    var src = el.textContent;
+    return mermaid.render(id, src).then(function (res) {{
+      el.innerHTML = res.svg;
+    }}).catch(function () {{
+      el.innerHTML = '<div class="mm-error">[mermaid 渲染失败]</div>';
+    }});
+  }});
+  Promise.all(jobs).then(function () {{ window.__mm_done = true; }});
+  setTimeout(function () {{ window.__mm_done = true; }}, 8000);
+}});
+</script>
+</body></html>"""
+    try:
+        return _BROWSER_BROKER.run(_task_mermaid_images(page_html, len(sources)))
+    except Exception:
+        return [None] * len(sources)
+
+
 def build_html_doc(md_text: str) -> str:
-    """生成完整 HTML 文档(带排版样式), 用于 PDF 渲染。"""
+    """生成完整 HTML 文档(带排版样式), 用于 PDF 渲染。
+
+    若含 ```mermaid 块, 额外嵌入本地 mermaid.min.js(离线, 不发起外部请求),
+    在 PDF 输出前把图渲染为 SVG; 渲染失败则显示带源码的错误块。"""
     body = markdown_to_html_body(md_text)
-    return _HTML_TEMPLATE.format(css=LAYOUT_CSS, content=body)
+    footer = _mermaid_footer() if _has_mermaid(md_text) else ""
+    return _HTML_TEMPLATE.format(css=LAYOUT_CSS, content=body) + footer
 
 
 def _prefix_selectors(selector_list: str, prefix: str) -> str:
@@ -149,29 +309,172 @@ def extract_title(md_text: str) -> str | None:
     return None
 
 
-def _launch_browser(p):
-    """优先本机 Edge, 没有则回退 Playwright Chromium。"""
+# ---------------------------------------------------------------------------
+# 进程级共享浏览器(单实例 + 专用线程): 无冷启动, 任意调用线程可用。
+#
+# 背景: Playwright sync API 的 driver 绑定「创建它的线程」, 而 FastAPI 同步端点
+# 跑在线程池、TestClient 跑在 portal 线程 —— 线程各建一个浏览器会反复冷启动
+# (每个 2~4s, 这就是下载慢的根因)。这里用一个**专用线程**独占 driver, 其它
+# 线程把「整页任务」(开 page→出 PDF/截图/读 DOM) 提交到队列串行执行,
+# 浏览器常驻复用, 浏览器掉线时自动重启并重试一次任务。
+# ---------------------------------------------------------------------------
+import queue
+import threading
+
+
+def _new_browser(pw):
     try:
-        return p.chromium.launch(channel="msedge", headless=True)
+        return pw.chromium.launch(channel="msedge", headless=True)
     except Exception:
-        return p.chromium.launch(headless=True)
+        return pw.chromium.launch(headless=True)
+
+
+def _is_browser_fatal(err: BaseException) -> bool:
+    """判断异常是否属于「浏览器本体挂掉」(需要重建), 而非任务自身失败。"""
+    msg = str(err).lower()
+    return any(k in msg for k in ("target closed", "not connected",
+                                  "browser has been closed", "browser is closed",
+                                  "process exception"))
+
+
+class _BrowserBroker:
+    """持有常驻无头浏览器的专用线程; 外部线程用 run(fn) 提交整页任务。"""
+
+    def __init__(self) -> None:
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread = threading.Thread(target=self._loop, name="mm-browser", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        with sync_playwright() as pw:
+            browser = _new_browser(pw)
+            while True:
+                item = self._q.get()
+                if item is None:                     # 停机信号
+                    break
+                fn, box, done = item
+                retried = False
+                while True:
+                    try:
+                        box[0] = fn(browser)
+                        box[1] = None
+                        break
+                    except BaseException as e:
+                        if not retried and _is_browser_fatal(e):
+                            retried = True           # 浏览器掉了: 重建后重试同一任务
+                            with contextlib.suppress(Exception):
+                                browser.close()
+                            try:
+                                browser = _new_browser(pw)
+                            except Exception:
+                                box[1] = e
+                                break
+                            continue
+                        box[1] = e
+                        break
+                done.set()
+
+    def run(self, fn, timeout: int = 120):
+        """在浏览器线程里执行 fn(browser) 并阻塞等结果。任务异常会原样抛出。"""
+        box: list = [None, None]
+        done = threading.Event()
+        self._q.put((fn, box, done))
+        if not done.wait(timeout):
+            raise RuntimeError(f"浏览器渲染超时(>{timeout}s)")
+        if box[1] is not None:
+            raise box[1]
+        return box[0]
+
+    def stop(self) -> None:
+        with contextlib.suppress(Exception):
+            self._q.put(None)
+            self._thread.join(timeout=5)
+
+
+_BROWSER_BROKER = _BrowserBroker()
+atexit.register(_BROWSER_BROKER.stop)
+
+
+def _task_pdf(html: str, wait_mm: bool):
+    """整页任务: 生成 A4 PDF。"""
+    def fn(b):
+        page = b.new_page()
+        try:
+            page.set_content(html)
+            if wait_mm:
+                page.wait_for_function("window.__mm_done === true", timeout=15000)
+                page.wait_for_timeout(200)
+            return page.pdf(format="A4", print_background=True,
+                            margin={"top": "0", "bottom": "0", "left": "0", "right": "0"})
+        finally:
+            page.close()
+    return fn
+
+
+def _task_image(html: str, fmt: str, wait_mm: bool):
+    """整页任务: 长图截图(png/jpeg)。"""
+    def fn(b):
+        page = b.new_page(viewport={"width": 900, "height": 1200})
+        try:
+            page.set_content(html)
+            if wait_mm:
+                page.wait_for_function("window.__mm_done === true", timeout=15000)
+                page.wait_for_timeout(200)
+            else:
+                page.wait_for_timeout(200)
+            if fmt == "jpeg":
+                return page.screenshot(type="jpeg", full_page=True, quality=90)
+            return page.screenshot(type="png", full_page=True)
+        finally:
+            page.close()
+    return fn
+
+
+def _task_mermaid_images(page_html: str, count: int):
+    """整页任务: 批量 mermaid 渲染, 逐块截图(失败块为 None)。"""
+    def fn(b):
+        page = b.new_page(viewport={"width": 900, "height": 1200})
+        try:
+            page.set_content(page_html)
+            page.wait_for_function("window.__mm_done === true", timeout=30000)
+            page.wait_for_timeout(200)
+            out: list[bytes | None] = []
+            for i in range(count):
+                el = page.locator(f'div[data-idx="{i}"]')
+                if el.count() and el.locator(".mm-error").count():
+                    out.append(None)
+                else:
+                    out.append(el.screenshot(omit_background=True))
+            return out
+        finally:
+            page.close()
+    return fn
+
+
+def dom_mermaid_stats(md_text: str) -> dict:
+    """跑一遍 PDF 管线 HTML, 返回 {svg: 出图数, err: 错误块数}(供 verify 做强断言)。"""
+    html = build_html_doc(md_text)
+    def fn(b):
+        page = b.new_page()
+        try:
+            page.set_content(html)
+            page.wait_for_function("window.__mm_done === true", timeout=15000)
+            return page.evaluate(
+                "() => ({svg: document.querySelectorAll('.mermaid-diagram svg').length,"
+                "err: document.querySelectorAll('.mermaid-error').length})")
+        finally:
+            page.close()
+    return _BROWSER_BROKER.run(fn)
 
 
 def markdown_to_pdf(md_text: str) -> tuple[bytes, str]:
-    """Markdown -> PDF, 返回 (PDF 字节, 建议文件名)。"""
+    """Markdown -> PDF, 返回 (PDF 字节, 建议文件名)。
+
+    含 mermaid 时等待页面置位 window.__mm_done(所有图渲染完成)再出 PDF, 否则不等待。
+    走进程级共享浏览器, 无冷启动。"""
     html = build_html_doc(md_text)
-    with sync_playwright() as p:
-        browser = _launch_browser(p)
-        try:
-            page = browser.new_page()
-            page.set_content(html)
-            pdf = page.pdf(
-                format="A4",
-                print_background=True,
-                margin={"top": "0", "bottom": "0", "left": "0", "right": "0"},
-            )
-        finally:
-            browser.close()
+    wait_mm = _has_mermaid(md_text)
+    pdf = _BROWSER_BROKER.run(_task_pdf(html, wait_mm))
     if not pdf.startswith(b"%PDF"):
         raise RuntimeError("生成的 PDF 无效")
     return pdf, (extract_title(md_text) or "文档") + ".pdf"
@@ -237,12 +540,58 @@ def _set_cell_borders(cell):
     tcPr.append(borders)
 
 
-def _markdown_blocks_to_doc(doc, md_text: str) -> None:
-    """把 Markdown 的块级结构写进 Word 文档。"""
+def _word_collect_mermaid(md_text: str) -> list[str]:
+    """按出现顺序收集 Markdown 里所有 ```mermaid 块的源码(供 Word 批量渲染成图)。
+
+    仅识别 ```mermaid 围栏; 其它语言代码块、未闭合围栏交回 `_close_unterminated_fences`
+    在渲染管线里统一处理。返回空列表表示无 mermaid。"""
+    out: list[str] = []
+    lines = md_text.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        m = re.match(r"^\s*```\s*mermaid\s*$", lines[i])
+        if m:
+            i += 1
+            buf = []
+            while i < n and not lines[i].strip().startswith("```"):
+                buf.append(lines[i])
+                i += 1
+            src = "\n".join(buf)
+            if src.strip():
+                out.append(src)
+        i += 1
+    return out
+
+
+def _doc_add_mermaid_image(doc, png: bytes | None, src: str) -> None:
+    """往 Word 段落流插入 mermaid 图(透明 PNG)。渲染失败(None)则降级为源码文本段落。"""
+    if png:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(6)
+        p.paragraph_format.space_after = Pt(6)
+        run = p.add_run()
+        # 白底更稳: docx 图片默认透明底在部分 Word 版本渲染不佳, 这里直接插图即可
+        run.add_picture(io.BytesIO(png), width=Inches(5.5))
+    else:
+        p = doc.add_paragraph()
+        p.paragraph_format.left_indent = Pt(12)
+        r = p.add_run("[mermaid 渲染失败]\n" + src)
+        r.font.name = "Consolas"
+        r.font.size = Pt(9)
+        r.font.color.rgb = RGBColor(0xD1, 0x24, 0x2F)
+        _doc_set_cjk(r, "Consolas")
+
+
+def _markdown_blocks_to_doc(doc, md_text: str, mermaid_imgs: list[bytes | None] | None = None) -> None:
+    """把 Markdown 的块级结构写进 Word 文档。
+
+    mermaid_imgs: 若提供, 按 ```mermaid 块出现顺序对应 (png 字节 或 None 降级文本)。"""
     lines = md_text.splitlines()
     i = 0
     in_code = False
+    code_lang = ""
     code_buf: list[str] = []
+    mcur = 0
 
     while i < len(lines):
         raw = lines[i]
@@ -251,18 +600,28 @@ def _markdown_blocks_to_doc(doc, md_text: str) -> None:
         # 代码块
         if line.lstrip().startswith("```"):
             if not in_code:
-                in_code, code_buf = True, []
+                m = re.match(r"^\s*```\s*(\w+)?\s*$", line)
+                in_code, code_lang, code_buf = True, (m.group(1) or "" if m else ""), []
                 i += 1
                 continue
             else:
                 in_code = False
-                p = doc.add_paragraph()
-                p.paragraph_format.left_indent = Pt(12)
-                r = p.add_run("\n".join(code_buf))
-                r.font.name = "Consolas"
-                r.font.size = Pt(9)
-                r.font.color.rgb = RGBColor(0x24, 0x29, 0x2F)
-                _doc_set_cjk(r, "Consolas")
+                src = "\n".join(code_buf)
+                lang = code_lang                     # 先取语言, 再清空
+                code_lang = ""
+                if lang.lower() == "mermaid":
+                    png = mermaid_imgs[mcur] if mermaid_imgs and mcur < len(mermaid_imgs) else None
+                    _doc_add_mermaid_image(doc, png, src)
+                    mcur += 1
+                else:
+                    p = doc.add_paragraph()
+                    p.paragraph_format.left_indent = Pt(12)
+                    r = p.add_run(src)
+                    r.font.name = "Consolas"
+                    r.font.size = Pt(9)
+                    r.font.color.rgb = RGBColor(0x24, 0x29, 0x2F)
+                    _doc_set_cjk(r, "Consolas")
+                code_buf = []
                 i += 1
                 continue
         if in_code:
@@ -370,9 +729,14 @@ def _new_word_doc() -> Document:
 
 
 def markdown_to_word(md_text: str) -> tuple[bytes, str]:
-    """Markdown -> Word(.docx), 返回 (docx 字节, 建议文件名)。"""
+    """Markdown -> Word(.docx), 返回 (docx 字节, 建议文件名)。
+
+    ```mermaid 块渲染成透明 PNG 插图(与 PPT 同管线); 无 mermaid 时行为与原来完全一致。"""
+    fixed = _close_unterminated_fences(md_text)
     doc = _new_word_doc()
-    _markdown_blocks_to_doc(doc, md_text)
+    sources = _word_collect_mermaid(fixed)
+    imgs = _mermaid_render_images(sources) if sources else None
+    _markdown_blocks_to_doc(doc, fixed, imgs)
     buf = io.BytesIO()
     doc.save(buf)
     data = buf.getvalue()
@@ -408,25 +772,19 @@ _IMG_HTML_TEMPLATE = """<!DOCTYPE html>
 
 
 def _markdown_to_image(md_text: str, fmt: str) -> tuple[bytes, str]:
-    """把 Markdown 渲染成一张长图(png/jpeg)。内容在固定宽度容器内排版。"""
+    """把 Markdown 渲染成一张长图(png/jpeg)。内容在固定宽度容器内排版。
+
+    含 mermaid 图时嵌入本地 mermaid.js, 等待 SVG 渲染完成再整页截图。"""
     body = markdown_to_html_body(md_text)
     # 图片版用「容器内」作用域样式: 把 LAYOUT_CSS 选择器加到 .doc 下, 白底
     css = preview_css().replace("#preview", ".doc")
     html = _IMG_HTML_TEMPLATE.format(css=css, content=body)
+    has_mermaid = _has_mermaid(md_text)
+    if has_mermaid:
+        html = html.replace("</body>", _mermaid_footer() + "</body>")
     ext = "jpg" if fmt == "jpeg" else "png"
     mime = "jpeg" if fmt == "jpeg" else "png"
-    with sync_playwright() as p:
-        browser = _launch_browser(p)
-        try:
-            page = browser.new_page(viewport={"width": 900, "height": 1200})
-            page.set_content(html)
-            page.wait_for_timeout(200)
-            if mime == "jpeg":
-                img = page.screenshot(type="jpeg", full_page=True, quality=90)
-            else:
-                img = page.screenshot(type="png", full_page=True)
-        finally:
-            browser.close()
+    img = _BROWSER_BROKER.run(_task_image(html, mime, has_mermaid))
     magic = (b"\xff\xd8\xff" if fmt == "jpeg" else b"\x89PNG")
     if not img.startswith(magic):
         raise RuntimeError(f"生成的 {ext} 图片无效")
@@ -538,7 +896,7 @@ def _ppt_parse(md_text: str) -> list[dict]:
         cur = last_content()
         if cur:
             return cur
-        s = {"kind": "content", "title": title, "bullets": []}
+        s = {"kind": "content", "title": title, "items": []}
         slides.append(s)
         return s
 
@@ -546,16 +904,24 @@ def _ppt_parse(md_text: str) -> list[dict]:
         raw = lines[i]
         stripped = raw.strip()
 
-        # 代码块: 作为一条要点
+        # 代码块: ```mermaid -> 图块(方案B图文混排), 其它语言 -> 折成一条文本要点
         if stripped.startswith("```"):
+            lang = stripped[3:].strip().lower()
             i += 1
             code = []
             while i < n and not lines[i].strip().startswith("```"):
                 code.append(lines[i].rstrip())
                 i += 1
-            snippet = "  ".join(c.strip() for c in code if c.strip())
-            if snippet:
-                ensure_content(slides[-1]["title"] if slides else "内容")["bullets"].append("» " + snippet[:80])
+            if lang == "mermaid":
+                src = "\n".join(c for c in code if c.strip())
+                if src.strip():
+                    ensure_content(slides[-1]["title"] if slides else "内容")["items"].append(
+                        {"type": "mermaid", "src": src})
+            else:
+                snippet = "  ".join(c.strip() for c in code if c.strip())
+                if snippet:
+                    ensure_content(slides[-1]["title"] if slides else "内容")["items"].append(
+                        "» " + snippet[:80])
             continue
 
         m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
@@ -569,11 +935,11 @@ def _ppt_parse(md_text: str) -> list[dict]:
                     i += 1
                     continue
                 else:
-                    slides.append({"kind": "section", "title": text, "bullets": []})
+                    slides.append({"kind": "section", "title": text, "items": []})
                     i += 1
                     continue
             # 二/三/四/五级标题 -> 内容页
-            s = {"kind": "content", "title": text, "bullets": []}
+            s = {"kind": "content", "title": text, "items": []}
             slides.append(s)
             i += 1
             continue
@@ -586,7 +952,7 @@ def _ppt_parse(md_text: str) -> list[dict]:
         # 表格: 取表头做要点
         if stripped.startswith("|") and i + 1 < n and re.match(r"^\|[\s\-:|]+\|$", lines[i + 1].strip()):
             header = [c.strip() for c in stripped.strip("|").split("|")]
-            ensure_content("内容")["bullets"].append("· " + "  |  ".join(h for h in header if h))
+            ensure_content("内容")["items"].append("· " + "  |  ".join(h for h in header if h))
             i += 2
             continue
 
@@ -596,36 +962,49 @@ def _ppt_parse(md_text: str) -> list[dict]:
             depth = len(raw) - len(raw.lstrip())
             txt = _ppt_strip_inline(m_li.group(2))
             indent = "   " * min(depth // 2, 2)
-            ensure_content("内容")["bullets"].append(indent + "• " + txt)
+            ensure_content("内容")["items"].append(indent + "• " + txt)
             i += 1
             continue
         m_q = re.match(r"^>\s*(.*)$", stripped)
         if m_q:
-            ensure_content("内容")["bullets"].append("‖ " + _ppt_strip_inline(m_q.group(1)))
+            ensure_content("内容")["items"].append("‖ " + _ppt_strip_inline(m_q.group(1)))
             i += 1
             continue
-        ensure_content("内容")["bullets"].append(_ppt_strip_inline(stripped))
+        ensure_content("内容")["items"].append(_ppt_strip_inline(stripped))
         i += 1
 
     # 封面副标题: 取封面后、第一个标题前的第一段正文
     if cover_seen and slides and slides[0]["kind"] == "cover":
         for s in slides[1:]:
             if s["kind"] == "content":
-                if s["bullets"]:
-                    slides[0]["subtitle"] = s["bullets"][0].lstrip("• ‖ »  ").strip()
+                if s["items"]:
+                    first = s["items"][0]
+                    if isinstance(first, str):
+                        slides[0]["subtitle"] = first.lstrip("• ‖ »  ").strip()
                 break
 
-    # 拆分要点过多的内容页
+    # 拆分内容页: 文本要点占 1 个单位, mermaid 图块占 2 个(图占版面大), 超过上限拆「(续)」页
     out: list[dict] = []
     for s in slides:
         if s["kind"] != "content":
             out.append(s)
             continue
-        bullets = s["bullets"]
-        chunks = [bullets[k:k + _PPT_MAX_BULLETS] for k in range(0, len(bullets), _PPT_MAX_BULLETS)] or [[]]
+        items = s["items"]
+        chunks: list[list] = []
+        cur: list = []
+        units = 0
+        for it in items:
+            cost = 2 if isinstance(it, dict) else 1
+            if units + cost > _PPT_MAX_BULLETS and cur:
+                chunks.append(cur)
+                cur, units = [], 0
+            cur.append(it)
+            units += cost
+        if cur or not chunks:
+            chunks.append(cur)
         for idx, chunk in enumerate(chunks):
             title = s["title"] if idx == 0 else f"{s['title']}（续）"
-            out.append({"kind": "content", "title": title, "bullets": chunk})
+            out.append({"kind": "content", "title": title, "items": chunk})
     return out
 
 
@@ -667,6 +1046,28 @@ def _ppt_title_size(len_title: int) -> int:
     return 24
 
 
+def _ppt_insert_image(slide, png: bytes, left: float, top: float,
+                     max_w: float, max_h: float) -> tuple[float, float]:
+    """把透明 PNG 按「不超框、保持宽高比、水平居中」插入, 返回 (实际宽, 实际高)(英寸)。
+
+    宽高取自 PNG IHDR, 按框缩放; 渲染失败(png=None)时不插, 返回 (0, 0)。"""
+    if not png:
+        return (0.0, 0.0)
+    dim = _png_size(png)
+    w_in, h_in = max_w, max_h
+    if dim:
+        w_px, h_px = dim
+        if w_px > 0 and h_px > 0:
+            scale = min(max_w / (w_px / 96.0), max_h / (h_px / 96.0))
+            w_in = (w_px / 96.0) * scale
+            h_in = (h_px / 96.0) * scale
+    # 水平居中
+    x = left + (max_w - w_in) / 2
+    slide.shapes.add_picture(io.BytesIO(png), Inches(x), Inches(top),
+                             width=Inches(w_in), height=Inches(h_in))
+    return (w_in, h_in)
+
+
 def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> bytes:
     tkey = template if template in PPT_TEMPLATES else PPT_DEFAULT_TEMPLATE
     theme = _ppt_theme(tkey)
@@ -674,6 +1075,19 @@ def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> byte
     title_c, foot_c, sub_c = theme["title"], theme["footer"], theme["subtitle"]
     panel_c, panel_a = theme.get("panel"), theme.get("panel_alpha", 80)
     bgp = _ppt_bg_path(tkey)   # 背景图路径(缺失则退回纯色)
+
+    # 预先批量渲染所有 mermaid 图为透明 PNG(一次无头浏览器会话), 按页序回填到各图块。
+    # 渲染失败(None)的图块由版面逻辑降级为「[mermaid 渲染失败]」文本要点。
+    sources = _mermaid_sources(slides)
+    images = _mermaid_render_images(sources) if sources else []
+    cursor = 0
+    for s in slides:
+        if s["kind"] != "content":
+            continue
+        for it in s["items"]:
+            if isinstance(it, dict) and it.get("type") == "mermaid":
+                it["png"] = images[cursor]
+                cursor += 1
 
     prs = Presentation()
     prs.slide_width = Inches(13.333)
@@ -740,7 +1154,7 @@ def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> byte
             bar.fill.solid(); bar.fill.fore_color.rgb = accent
             bar.line.fill.background()
 
-        else:  # content
+        else:  # content —— 图文混排(方案 B): 文本要点与 mermaid 图按序竖向排布
             # 标题
             tb = _ppt_add_textbox(slide, 0.7, 0.5, 11.9, 0.9)
             p = tb.text_frame.paragraphs[0]
@@ -749,18 +1163,70 @@ def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> byte
             bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.75), Inches(1.45), Inches(1.6), Inches(0.07))
             bar.fill.solid(); bar.fill.fore_color.rgb = accent
             bar.line.fill.background()
-            # 要点
-            bullets = s["bullets"]
-            if bullets:
-                bt = _ppt_add_textbox(slide, 0.9, 1.9, 11.4, 5.0)
-                tf = bt.text_frame
-                tf.word_wrap = True
-                size = 20 if len(bullets) <= 5 else 18
-                for j, b in enumerate(bullets):
-                    para = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
-                    para.space_after = PptPt(10)
-                    para.line_spacing = 1.1
-                    _ppt_set_run(para.add_run(), b, size, color=theme["body"])
+
+            # 渲染失败的 mermaid(None) 降级为文本要点, 其余文本原样
+            normalized = []
+            for it in s.get("items", []):
+                if isinstance(it, dict) and it.get("type") == "mermaid":
+                    if it.get("png"):
+                        normalized.append({"type": "img", "png": it["png"]})
+                    else:
+                        first = (it.get("src") or "").splitlines()[0][:30]
+                        normalized.append("[mermaid 渲染失败: " + first + "]")
+                else:
+                    normalized.append(it)
+            if not normalized:
+                continue
+
+            # 连续文本合并成一个 text 块, 图独立成块
+            blocks = []
+            for it in normalized:
+                if isinstance(it, str):
+                    if blocks and blocks[-1]["type"] == "text":
+                        blocks[-1]["lines"].append(it)
+                    else:
+                        blocks.append({"type": "text", "lines": [it]})
+                else:
+                    blocks.append(it)
+
+            # 版面: 文本区纵向分配, 超高则整体等比压缩
+            AREA_X, AREA_W = 0.9, 11.5
+            AREA_TOP, AREA_BOT = 1.85, 6.95
+            area_h = AREA_BOT - AREA_TOP
+            for b in blocks:
+                if b["type"] == "text":
+                    b["_h"] = min(3.0, 0.55 * len(b["lines"]) + 0.2)
+                else:
+                    dim = _png_size(b["png"])
+                    if dim:
+                        nat_w, nat_h = dim[0] / 96.0, dim[1] / 96.0
+                        b["_h"] = max(0.8, min(2.4, nat_h * min(8.5 / nat_w, 2.4 / nat_h)))
+                    else:
+                        b["_h"] = 1.5
+            total = sum(b["_h"] for b in blocks)
+            gap = 0.15
+            needed = total + gap * (len(blocks) - 1)
+            scale_f = 1.0 if needed <= area_h else area_h / (needed + 0.3)
+
+            y = AREA_TOP
+            for b in blocks:
+                h = b["_h"] * scale_f
+                if b["type"] == "text":
+                    bt = _ppt_add_textbox(slide, AREA_X, y, AREA_W, h)
+                    tf = bt.text_frame
+                    tf.word_wrap = True
+                    tf.vertical_anchor = MSO_ANCHOR.TOP
+                    size = 18 if len(b["lines"]) <= 4 else 15
+                    if scale_f < 0.85:
+                        size = 14
+                    for j, ln in enumerate(b["lines"]):
+                        para = tf.paragraphs[0] if j == 0 else tf.add_paragraph()
+                        para.space_after = PptPt(6)
+                        para.line_spacing = 1.05
+                        _ppt_set_run(para.add_run(), ln, size, color=theme["body"])
+                else:
+                    _ppt_insert_image(slide, b["png"], AREA_X, y, AREA_W, h)
+                y += h + gap * scale_f
 
     buf = io.BytesIO()
     prs.save(buf)

@@ -234,12 +234,75 @@ def step2_page_and_api() -> None:
     print("[OK] 26. 页面含 PPT 模板区, 选中 PPT 时显示, 下载携带 template")
 
 
+def step_mermaid_core() -> None:
+    """mermaid 图表: 含 ```mermaid 块的 Markdown, 离线内嵌本地 mermaid.js 渲染成 SVG。"""
+    md = "# 图\n\n```mermaid\ngraph LR\nA --> B\n```\n"
+    # 1) 含 mermaid -> 内嵌本地 mermaid.js(内联, 不引外部 CDN 的 <script src>)
+    doc = build_html_doc(md)
+    assert "mermaid.initialize" in doc, "含 mermaid 块未内嵌渲染脚本"
+    assert "<script src=" not in doc, "不应引用外部 <script src>(需离线, 数据不出本机)"
+    print("[OK] 27. 含 mermaid 块时离线内嵌本地 mermaid.js(无外部脚本引用)")
+    # 2) 不含 mermaid -> 不注入(零额外体积)
+    doc2 = build_html_doc("# 纯文本\n\n正文")
+    assert "mermaid.initialize" not in doc2, "无 mermaid 块不应注入 mermaid.js"
+    print("[OK] 28. 无 mermaid 块时不注入 mermaid.js(零额外体积)")
+    # 3) PNG 长图渲染出图: 含 SVG 图形的 PNG 一定比纯文本版大
+    png_plain, _ = markdown_to_png("# t\n\n正文")
+    png_mermaid, _ = markdown_to_png(md)
+    assert len(png_mermaid) > len(png_plain), "mermaid 图未渲染进长图(体积未增长)"
+    print(f"[OK] 29. mermaid 图渲染进 PNG 长图({len(png_mermaid)} vs {len(png_plain)} 字节)")
+    # 4) 预览接口返回 mermaid 标记 + /assets/js 静态路由可达
+    from fastapi.testclient import TestClient
+    import main
+    client = TestClient(main.app)
+    assert client.get("/api/html-preview", params={"md": md}).json().get("mermaid") is True
+    assert client.get("/api/html-preview", params={"md": "# x\n\ny"}).json().get("mermaid") is False
+    r = client.get("/assets/js/mermaid.min.js")
+    assert r.status_code == 200 and len(r.content) > 100000, "/assets/js 静态路由不可达"
+    print("[OK] 30. 预览接口返回 mermaid 标记, /assets/js 静态路由可达")
+    # 5) PPT 方案 B: 内容页 mermaid 渲染成透明 PNG 并嵌入(图文混排, 非文本降级)
+    import io as _io
+    import zipfile as _zip
+    import re as _re
+    multi = (BASE / "test_sample.md").read_text(encoding="utf-8")
+    assert multi.count("mermaid") >= 2, "test_sample.md 应含多张 mermaid 图"
+    pp_data, _ = markdown_to_pptx(multi)
+    zf = _zip.ZipFile(_io.BytesIO(pp_data))
+    media = [n for n in zf.namelist() if n.startswith("ppt/media/")]
+    slide_blips = sum(len(_re.findall(r"<a:blip", zf.read(n).decode()))
+                      for n in zf.namelist()
+                      if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
+    assert len(media) >= 2 and slide_blips >= 2, \
+        f"PPT 未嵌入 mermaid 图(仅 {len(media)} 媒体, {slide_blips} 引用)"
+    (BASE / "output" / "sample_mermaid.pptx").write_bytes(pp_data)
+    print(f"[OK] 31. PPT 方案B: mermaid 渲染成透明 PNG 并嵌入({len(media)} 张媒体, 图文混排)")
+    # 6) DOM 级强断言: 后端渲染管线确确实实出 <svg>(而非静默出错误块)
+    #    取代 #29「PNG 变大」的弱判断 —— 渲染失败(错误块文字)同样会让 PNG 变大,
+    #    只有直接数 DOM 里 .mermaid-diagram svg 数量才算真正成功。
+    #    复用进程级共享浏览器(走 renderer.dom_mermaid_stats 的整页任务),
+    #    不在本线程另起 sync_playwright(与常驻 driver 冲突)。
+    import renderer
+    dom = renderer.dom_mermaid_stats(md)
+    assert dom["svg"] >= 1 and dom["err"] == 0, f"mermaid 后端未真正渲染出 SVG: {dom}"
+    print(f"[OK] 32. 后端渲染管线 DOM 级确认出 SVG({dom['svg']} 个, 0 错误块)")
+    # 7) Word 方案: 内容页 ```mermaid 渲染成透明 PNG 并 add_picture 嵌入(非文本降级)
+    import io as _io2
+    import zipfile as _zip2
+    word_data, _ = markdown_to_word(multi)
+    wzf = _zip2.ZipFile(_io2.BytesIO(word_data))
+    wmedia = [n for n in wzf.namelist() if n.startswith("word/media/")]
+    assert len(wmedia) >= 5, f"Word 未嵌入 mermaid 图(仅 {len(wmedia)} 张媒体)"
+    (BASE / "output" / "sample_mermaid.docx").write_bytes(word_data)
+    print(f"[OK] 33. Word: mermaid 渲染成 PNG 并 add_picture 嵌入({len(wmedia)} 张, 非文本降级)")
+
+
 def main() -> int:
     step1_pdf_core()
     step1b_word_core()
     step1c_image_core()
     step1d_ppt_core()
     step2_page_and_api()
+    step_mermaid_core()
     print("\n全部验证通过")
     return 0
 

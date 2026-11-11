@@ -207,6 +207,72 @@ const FMT_META = {
 /* ---------- 中栏: 实时预览 ---------- */
 /* 输入框固定高度, 内容多时内部滚动, 无需 JS 调高度 */
 let previewTimer = null;
+
+/* mermaid 懒加载: 仅当内容含 ```mermaid 时才从本地 /assets/js 拉 mermaid.js(不发 CDN)。
+   不信任 window.mermaid 全局(它可能被污染成空壳): 用本地 _mermaidApi 缓存「已校验可用」的
+   API; 加载时带时间戳强制重新执行 IIFE(?cb=), 成功后校验 .render 可用才采纳。 */
+let _mermaidApi = null;      // 已加载且校验通过的 mermaid API
+let _mermaidLoading = null;  // 进行中的加载 Promise
+function ensureMermaid() {
+  if (_mermaidApi) return Promise.resolve(_mermaidApi);
+  if (_mermaidLoading) return _mermaidLoading;
+  _mermaidLoading = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "/assets/js/mermaid.min.js?cb=" + Date.now();   // 缓存击穿, 强制重新执行
+    s.onload = () => {
+      const api = window.mermaid;
+      if (api && typeof api.render === "function") {
+        api.initialize({ startOnLoad: false, theme: "default" });
+        _mermaidApi = api;
+        resolve(api);
+      } else {
+        _mermaidLoading = null;                              // 允许下次重试
+        reject(new Error("mermaid API 未就绪(render 缺失)"));
+      }
+    };
+    s.onerror = () => { _mermaidLoading = null; reject(new Error("mermaid.js 本地加载失败")); };
+    document.head.appendChild(s);
+  });
+  return _mermaidLoading;
+}
+
+/* 把 #preview 内的 mermaid 源码块(pre code.language-mermaid)替换为 .mermaid-diagram.mermaid-loading 占位框:
+   用 CSS 隐藏源码文字、显示「图表渲染中…」。这一步**不依赖 mermaid.js**,
+   所以能在预览 HTML 刚插入时就立即调用, 避免懒加载空窗期露出原始代码造成「未识别」错觉。 */
+function prepareMermaidPlaceholders() {
+  const root = $("preview");
+  root.querySelectorAll("pre code.language-mermaid").forEach(el => {
+    const div = document.createElement("div");
+    div.className = "mermaid-diagram mermaid-loading";
+    div.textContent = el.textContent;
+    const pre = el.closest("pre");
+    if (pre) pre.parentNode.replaceChild(div, pre);
+    else el.parentNode.replaceChild(div, el);
+  });
+}
+
+/* mermaid.js 就绪后, 把 .mermaid-diagram 占位框渲染成 SVG:
+   逐张调 render(唯一id, 源码)(v10 promise 形式, 解析结果取 .svg),
+   成功则把 SVG 填入占位框并移除占位样式; 某图失败则换成带源码的错误块, 便于排查。
+   api 为 ensureMermaid 校验过的 mermaid API(不读可能被污染的 window.mermaid)。 */
+function renderPreviewMermaid(api) {
+  const root = $("preview");
+  const targets = Array.prototype.slice.call(root.querySelectorAll(".mermaid-diagram"));
+  targets.forEach((d, i) => {
+    const id = "mm-preview-" + Date.now() + "-" + i + "-" + Math.floor(Math.random() * 1e6);
+    const src = d.textContent;
+    api.render(id, src).then(res => {
+      d.innerHTML = res.svg || res;                 // v10 解析结果 {svg,...}
+      d.classList.remove("mermaid-loading");
+    }).catch(() => {
+      const err = document.createElement("div");
+      err.className = "mermaid-error";
+      err.textContent = "[mermaid 渲染失败: 请检查语法]\n\n" + src;
+      d.parentNode.replaceChild(err, d);
+    });
+  });
+}
+
 function schedulePreview() {
   clearTimeout(previewTimer);
   previewTimer = setTimeout(doPreview, 250);
@@ -225,6 +291,20 @@ async function doPreview() {
       tag.id = "preview-layout-css";
       tag.textContent = data.css;
       document.head.appendChild(tag);
+    }
+    if (data.mermaid) {  // 含 ```mermaid 块: 先显示「图表渲染中…」占位(不露原始代码),
+      prepareMermaidPlaceholders();                        // 再懒加载本地 mermaid.js 渲染成 SVG
+      try {
+        const api = await ensureMermaid();
+        renderPreviewMermaid(api);
+      } catch (me) {  // mermaid.js 本地加载失败: 把占位框换成错误块
+        box.querySelectorAll(".mermaid-diagram.mermaid-loading").forEach(d => {
+          const err = document.createElement("div");
+          err.className = "mermaid-error";
+          err.textContent = "[mermaid.js 本地加载失败: " + me.message + "]";
+          d.parentNode.replaceChild(err, d);
+        });
+      }
     }
   } catch (e) {
     box.innerHTML = "<div class='empty' style='color:#d1242f'>预览失败: " + e.message + "</div>";

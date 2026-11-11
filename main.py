@@ -28,6 +28,8 @@ app = FastAPI(title="Markdown 转换工具", version="1.0.0")
 
 WEB_DIR = Path(__file__).parent / "web"
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
+# 本地离线 JS 库(mermaid 等), 中栏预览懒加载用, 不依赖 CDN
+app.mount("/assets/js", StaticFiles(directory=Path(__file__).parent / "assets" / "js"), name="assets-js")
 
 # 当前可用格式(后端已实现的), 页面右栏据此渲染按钮
 AVAILABLE_FORMATS = ["pdf", "word", "png", "jpg", "pptx"]
@@ -50,12 +52,15 @@ def sample():
 
 @app.get("/api/html-preview")
 def html_preview(md: str = ""):
-    """中栏实时预览: 返回渲染后的 HTML 片段 + 排版样式(与 PDF 一致)。"""
+    """中栏实时预览: 返回渲染后的 HTML 片段 + 排版样式(与 PDF 一致)。
+
+    mermaid 标记告诉前端「含 mermaid 块, 需懒加载本地 mermaid.js 渲染」。"""
     if not md.strip():
-        return {"html": "<p style='color:#888'>暂无内容</p>", "css": ""}
+        return {"html": "<p style='color:#888'>暂无内容</p>", "css": "", "mermaid": False}
     return {
         "html": renderer.markdown_to_html_body(md),
         "css": renderer.preview_css(),
+        "mermaid": renderer._has_mermaid(md),
     }
 
 
