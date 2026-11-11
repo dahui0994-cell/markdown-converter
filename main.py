@@ -7,8 +7,9 @@
 接口:
     GET  /                 中文操作页面(左输入 / 中预览 / 右格式+下载)
     GET  /api/html-preview 返回渲染后的 HTML 片段(中栏预览用)
-    POST /api/convert      表单 md + format -> 下载对应文件(当前仅 PDF)
+    POST /api/convert      表单 md + format(pdf/word/pptx/png/jpg) [+ template 仅 PPT] -> 下载对应文件
     GET  /api/formats      返回可用格式列表
+    GET  /api/ppt-templates 返回 PPT 可选配色模板列表
     GET  /api/sample       返回示例 Markdown(左栏「加载示例」)
     GET  /health           健康检查
 """

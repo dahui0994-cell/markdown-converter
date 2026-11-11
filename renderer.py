@@ -1,7 +1,9 @@
-"""渲染核心: Markdown -> 各格式。
+"""渲染核心: Markdown -> 各格式(PDF / Word / PPT / PNG / JPG)。
 
-当前实现 PDF(用本机 Edge 无头模式, 支持中文, 无需额外下载浏览器)。
-预留 Word / JPG / PNG 的扩展接口, 后续实现即可, 页面与调用方不用改。
+- PDF / PNG / JPG: 用本机 Edge 无头模式渲染(支持中文, 无需额外下载浏览器),
+  找不到 Edge 时自动回退 Playwright Chromium。
+- Word: 用 python-docx 生成结构化 .docx。
+- PPT: 用 python-pptx 生成 .pptx, 支持 6 款配色模板(见 PPT_TEMPLATES)。
 """
 
 import io
