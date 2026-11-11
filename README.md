@@ -13,7 +13,9 @@
   引用块蓝边浅底、代码块/表格避免跨页断裂
 - **Word (.docx)**：标题/列表/表格/代码块/引用结构化导出，中文统一微软雅黑，可再编辑
 - **PPT (.pptx)**：大纲转幻灯片，`#` 作封面/分节、`##` 作内容页，自动分页 + 页码；
-  内置 6 款配色模板（简约商务/科技深蓝/活力橙/清新绿/黑金尊享/创意紫），选中 PPT 后在右栏挑选
+  内置 6 款配色模板（简约商务/科技深蓝/活力橙/清新绿/黑金尊享/创意紫），各带创意背景图
+  （放射/透视网格/电路/太阳光芒/山峦/Art Deco/星轨等），文字区加半透明面板保证可读；
+  选中 PPT 后在右栏挑模板再下载
 - **PNG / JPG**：渲染为一张排版好的长图，适合分享
 - 纯本地运行，数据不出本机；PDF/PNG/JPG 用本机 Microsoft Edge 无头渲染，无需额外下载浏览器
 
@@ -47,10 +49,12 @@ python verify.py
 ```
 main.py          # FastAPI 服务: 页面 + /api/* 接口
 renderer.py      # 渲染核心: PDF / Word / PPT / PNG / JPG
+make_backgrounds.py # 生成 6 款 PPT 背景图(assets/ppt_bg/*.png)
 web/index.html   # 中文三板块页面(左输入/中预览/右格式+下载)
 verify.py        # 一键验证脚本
 sample.md        # 示例 Markdown
 requirements.txt # 依赖
+assets/ppt_bg/   # 6 款 PPT 背景图(PNG) + preview_grid.png
 ```
 
 ## 支持的导出格式

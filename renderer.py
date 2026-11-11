@@ -18,7 +18,7 @@ from playwright.sync_api import sync_playwright
 from pptx import Presentation
 from pptx.dml.color import RGBColor as PptRGB
 from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt as PptPt
 
 # 单一事实来源: 所有输出(PDF/预览)共用这一套样式, 保证所见即所得
@@ -447,27 +447,28 @@ def _hex(rgb: str) -> PptRGB:
     return PptRGB(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
 
-# 6 款 PPT 模板: 同一版式, 不同配色。key -> 颜色组。
-# name 为展示名(不参与转 RGB), 其余为 16 进制色值。
+# 6 款 PPT 模板: 同一版式, 不同配色。key -> 颜色组 + 背景图 + 文字区半透明面板。
+# name 为展示名(不参与转 RGB), 其余为 16 进制色值; bg_img 为 assets/ppt_bg/<key>.png;
+# panel / panel_alpha 为文字区底色(不透明度%), 深色模板用深色面板、浅色模板用白色面板。
 PPT_TEMPLATES: dict[str, dict] = {
     "business":  {"name": "简约商务", "bg": "#FFFFFF", "title": "#1A1A1A",
                   "body": "#24292F", "accent": "#2F6FEB", "footer": "#8A8F98",
-                  "subtitle": "#8A8F98"},
+                  "subtitle": "#8A8F98", "panel": "#FFFFFF", "panel_alpha": 86},
     "tech":      {"name": "科技深蓝", "bg": "#0F1B2D", "title": "#FFFFFF",
                   "body": "#E6F0FA", "accent": "#4FC3F7", "footer": "#7C8CA0",
-                  "subtitle": "#9FB6CC"},
+                  "subtitle": "#9FB6CC", "panel": "#0C1826", "panel_alpha": 74},
     "orange":    {"name": "活力橙",   "bg": "#FFF8F0", "title": "#3A2A1E",
                   "body": "#4A3B30", "accent": "#E8613C", "footer": "#B0988A",
-                  "subtitle": "#B0988A"},
+                  "subtitle": "#B0988A", "panel": "#FFF8F0", "panel_alpha": 80},
     "green":     {"name": "清新绿",   "bg": "#FFFFFF", "title": "#1F3D2E",
                   "body": "#2E3D36", "accent": "#2E9E5B", "footer": "#8A9A90",
-                  "subtitle": "#8A9A90"},
+                  "subtitle": "#8A9A90", "panel": "#FFFFFF", "panel_alpha": 80},
     "blackgold": {"name": "黑金尊享", "bg": "#141414", "title": "#FFFFFF",
                   "body": "#E8E2D0", "accent": "#D4AF37", "footer": "#8A8A8A",
-                  "subtitle": "#B8B8B8"},
+                  "subtitle": "#B8B8B8", "panel": "#101010", "panel_alpha": 70},
     "purple":    {"name": "创意紫",   "bg": "#FFFFFF", "title": "#2A2140",
                   "body": "#33303F", "accent": "#7C4DFF", "footer": "#9A94B0",
-                  "subtitle": "#9A94B0"},
+                  "subtitle": "#9A94B0", "panel": "#FFFFFF", "panel_alpha": 78},
 }
 PPT_DEFAULT_TEMPLATE = "business"
 # 兜底颜色(模板解析失败时)
@@ -475,9 +476,17 @@ PPT_DEFAULT = _hex("#24292F")
 
 
 def _ppt_theme(key: str | None) -> dict:
-    """把模板 key 解析成 {颜色名: RGB} (去掉展示名 name)。未知 key 回退默认。"""
+    """把模板 key 解析成 {颜色名: RGB} + 面板配置。未知 key 回退默认。"""
     raw = PPT_TEMPLATES.get(key or PPT_DEFAULT_TEMPLATE, PPT_TEMPLATES[PPT_DEFAULT_TEMPLATE])
-    return {k: _hex(v) for k, v in raw.items() if k != "name"}
+    theme = {k: _hex(v) for k, v in raw.items() if k != "name" and isinstance(v, str)}
+    theme["panel_alpha"] = raw.get("panel_alpha", 80)
+    return theme
+
+
+def _ppt_bg_path(key: str) -> Path | None:
+    """模板背景图路径(assets/ppt_bg/<key>.png), 缺失返回 None。"""
+    p = Path(__file__).parent / "assets" / "ppt_bg" / f"{key}.png"
+    return p if p.exists() else None
 
 
 def _ppt_strip_inline(text: str) -> str:
@@ -622,10 +631,47 @@ def _ppt_add_textbox(slide, left, top, width, height):
     return slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
 
 
+def _ppt_set_fill_alpha(shape, opacity_pct: int) -> None:
+    """给形状实心填充设置不透明度(0-100)。通过写 a:alpha(千分比)实现。"""
+    from pptx.oxml.ns import qn as _q
+    solid = shape.fill._xPr.find(_q("a:solidFill"))
+    srgb = solid.find(_q("a:srgbClr"))
+    a = srgb.makeelement(_q("a:alpha"), {"val": str(int(opacity_pct * 1000))})
+    srgb.append(a)
+
+
+def _ppt_add_panel(slide, left, top, width, height, color: PptRGB, opacity_pct: int) -> None:
+    """文字区半透明面板(圆角矩形), 铺在背景之上、文字之下, 提升可读性。"""
+    sh = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,
+                                Inches(left), Inches(top), Inches(width), Inches(height))
+    sh.fill.solid()
+    sh.fill.fore_color.rgb = color
+    sh.line.fill.background()
+    try:
+        sh.adjustments[0] = 0.045   # 小圆角
+    except Exception:
+        pass
+    _ppt_set_fill_alpha(sh, opacity_pct)
+
+
+def _ppt_title_size(len_title: int) -> int:
+    """封面主标题字号自适应: 标题越长字号越小, 尽量单行且不溢出。"""
+    if len_title <= 12:
+        return 44
+    if len_title <= 20:
+        return 36
+    if len_title <= 32:
+        return 28
+    return 24
+
+
 def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> bytes:
-    theme = _ppt_theme(template)
+    tkey = template if template in PPT_TEMPLATES else PPT_DEFAULT_TEMPLATE
+    theme = _ppt_theme(tkey)
     bg, accent = theme["bg"], theme["accent"]
     title_c, foot_c, sub_c = theme["title"], theme["footer"], theme["subtitle"]
+    panel_c, panel_a = theme.get("panel"), theme.get("panel_alpha", 80)
+    bgp = _ppt_bg_path(tkey)   # 背景图路径(缺失则退回纯色)
 
     prs = Presentation()
     prs.slide_width = Inches(13.333)
@@ -636,9 +682,20 @@ def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> byte
     for num, s in enumerate(slides, start=1):
         slide = prs.slides.add_slide(blank)
 
-        # 整页背景色(按模板)
+        # 整页背景: 先纯色兜底, 有背景图则铺满
         slide.background.fill.solid()
         slide.background.fill.fore_color.rgb = bg
+        if bgp is not None:
+            slide.shapes.add_picture(str(bgp), 0, 0, width=prs.slide_width, height=prs.slide_height)
+
+        # 文字区半透明面板(保证叠字可读), 按页型定位
+        if panel_c is not None:
+            if s["kind"] == "cover":
+                _ppt_add_panel(slide, 0.7, 2.0, 11.9, 5.2, panel_c, panel_a)
+            elif s["kind"] == "section":
+                _ppt_add_panel(slide, 2.0, 2.45, 9.33, 2.5, panel_c, panel_a)
+            else:  # content
+                _ppt_add_panel(slide, 0.5, 0.4, 12.33, 6.7, panel_c, panel_a)
 
         # 页码(右下角, 封面除外), 颜色随模板页脚色
         if s["kind"] != "cover":
@@ -652,16 +709,26 @@ def _ppt_build(slides: list[dict], template: str = PPT_DEFAULT_TEMPLATE) -> byte
             bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.0), Inches(0.0), Inches(0.18), Inches(7.5))
             bar.fill.solid(); bar.fill.fore_color.rgb = accent
             bar.line.fill.background()
-            tb = _ppt_add_textbox(slide, 1.0, 2.7, 11.3, 1.6)
-            p = tb.text_frame.paragraphs[0]; p.alignment = PP_ALIGN.LEFT
-            _ppt_set_run(p.add_run(), s["title"] or "演示文稿", 44, bold=True, color=title_c)
+            # 主标题: 开自动换行, 长标题不再撑出右侧边界; 过长自动缩小
+            tb = _ppt_add_textbox(slide, 1.0, 2.3, 11.4, 1.7)
+            tf = tb.text_frame
+            tf.word_wrap = True
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            p = tf.paragraphs[0]; p.alignment = PP_ALIGN.LEFT
+            title = s["title"] or "演示文稿"
+            _ppt_set_run(p.add_run(), title, _ppt_title_size(len(title)), bold=True, color=title_c)
+            # 副标题/介绍: 开自动换行 + 放宽高度, 长介绍文字不溢出
             if s.get("subtitle"):
-                tb2 = _ppt_add_textbox(slide, 1.0, 4.3, 11.3, 0.7)
-                p2 = tb2.text_frame.paragraphs[0]
-                _ppt_set_run(p2.add_run(), s["subtitle"], 22, color=sub_c)
-            tb3 = _ppt_add_textbox(slide, 1.0, 6.4, 11.3, 0.5)
+                tb2 = _ppt_add_textbox(slide, 1.0, 4.2, 11.4, 1.5)
+                tf2 = tb2.text_frame
+                tf2.word_wrap = True
+                p2 = tf2.paragraphs[0]; p2.line_spacing = 1.2
+                _ppt_set_run(p2.add_run(), s["subtitle"], 20, color=sub_c)
+            # 日期
+            tb3 = _ppt_add_textbox(slide, 1.0, 6.5, 11.4, 0.5)
+            tb3.text_frame.word_wrap = True
             p3 = tb3.text_frame.paragraphs[0]
-            _ppt_set_run(p3.add_run(), date.today().strftime("%Y / %m / %d"), 16, color=foot_c)
+            _ppt_set_run(p3.add_run(), date.today().strftime("%Y / %m / %d"), 14, color=foot_c)
 
         elif s["kind"] == "section":
             tb = _ppt_add_textbox(slide, 1.0, 3.0, 11.3, 1.4)

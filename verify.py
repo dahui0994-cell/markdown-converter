@@ -104,7 +104,16 @@ def step1d_ppt_core() -> None:
     xml = b"".join(zf.read(n) for zf in [zipfile.ZipFile(io.BytesIO(data))]
                    for n in zf.namelist() if n.startswith("ppt/slides/slide"))
     assert b"a:ea" in xml and "Microsoft YaHei".encode() in xml, "未写中文字体"
-    print(f"[OK] 11. PPT 结构正确({len(slides)}页, 封面标题/页码/中文字体齐全)")
+    # 封面文字自动换行(长标题/介绍不溢出): 封面所有文本框都开 word_wrap
+    cover_txt = [sh for sh in slides[0].shapes if sh.has_text_frame and sh.text_frame.text.strip()]
+    assert cover_txt, "封面无文本框"
+    assert all(sh.text_frame.word_wrap for sh in cover_txt), "封面文本框未全部开启换行"
+    # 背景图已嵌入 + 文字区半透明面板(叠字可读)
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    assert any(n.startswith("ppt/media/") for n in zf.namelist()), "未嵌入背景图"
+    assert b"a:blip" in xml, "幻灯片未引用背景图"
+    assert b"a:alpha" in xml, "文字区面板未设不透明度"
+    print(f"[OK] 11. PPT 结构正确({len(slides)}页, 封面/页码/中文字体/背景图/文字区面板齐全)")
 
 
 def step2_page_and_api() -> None:
