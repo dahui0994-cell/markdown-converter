@@ -22,7 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium
 
 # 应用代码 (含 assets/js/mermaid.min.js 离线渲染库)
-COPY main.py renderer.py web/ assets/ ./
+# 注意: 尾斜杠 COPY 会铺开「目录内容」, 这里显式保留目录结构,
+# 否则 /app/web、/app/assets 不会建出来, StaticFiles 会报错
+COPY main.py renderer.py sample.md ./
+COPY web/ ./web/
+COPY assets/ ./assets/
 
 # Chromium 在非 root / 无特权容器里需禁用沙箱 (renderer.py 读取该变量)
 ENV BROWSER_EXTRA_ARGS="--no-sandbox"
